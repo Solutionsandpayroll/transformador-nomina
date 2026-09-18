@@ -207,6 +207,83 @@ async function readWorkbookSheetsWithJSZip(file) {
 }
 
 // ============================================================================
+// UTILIDADES DE FECHA — "Mes elaboración" debe quedar como fecha real
+// ============================================================================
+// El rótulo del mes llega como texto libre en la columna A de cada bloque
+// ("Abril 2025", "MAYO 2025", "Marzo 2026", e incluso con errores de
+// digitación reales como "NNOVIEMBRE 2025"). El archivo de ejemplo que
+// compartió el cliente (Hoja2 de BUBBLE_-_Nómina_1.xlsm) espera que esa
+// columna sea una fecha (primer día del mes), no el texto tal cual.
+
+const MONTHS_ES = [
+  { key: 'ENERO', num: 0 },
+  { key: 'FEBRERO', num: 1 },
+  { key: 'MARZO', num: 2 },
+  { key: 'ABRIL', num: 3 },
+  { key: 'MAYO', num: 4 },
+  { key: 'JUNIO', num: 5 },
+  { key: 'JULIO', num: 6 },
+  { key: 'AGOSTO', num: 7 },
+  { key: 'SEPTIEMBRE', num: 8 },
+  { key: 'SETIEMBRE', num: 8 },
+  { key: 'OCTUBRE', num: 9 },
+  { key: 'NOVIEMBRE', num: 10 },
+  { key: 'DICIEMBRE', num: 11 }
+];
+
+function removeAccents(value) {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+// Colapsa letras repetidas consecutivas: "NNOVIEMBRE" -> "NOVIEMBRE"
+function collapseRepeatedLetters(value) {
+  return value.replace(/([A-Z])\1+/g, '$1');
+}
+
+// Convierte un rótulo de mes ("Abril 2025", "NNOVIEMBRE 2025", "MAYO 2025")
+// en un objeto Date (UTC, día 1 del mes). Devuelve null si no logra
+// reconocer mes y año en el texto.
+function parseMonthLabelToDate(label) {
+  if (label === null || label === undefined) return null;
+  const cleaned = removeAccents(String(label).toUpperCase());
+  const yearMatch = cleaned.match(/(\d{4})/);
+  if (!yearMatch) return null;
+  const year = parseInt(yearMatch[1], 10);
+
+  const lettersOnly = cleaned.replace(/[^A-Z]/g, '');
+
+  let found = MONTHS_ES.find((m) => lettersOnly.includes(m.key));
+  if (!found) {
+    // Tolerar errores de digitación tipo letras dobladas ("NNOVIEMBRE")
+    const collapsed = collapseRepeatedLetters(lettersOnly);
+    found = MONTHS_ES.find((m) => collapsed.includes(m.key));
+  }
+  if (!found) return null;
+
+  return new Date(Date.UTC(year, found.num, 1));
+}
+
+// Serial de fecha estilo Excel (días desde 1899-12-30), usando aritmética
+// UTC en ambos lados para evitar corrimientos por huso horario.
+function excelSerialFromDate(date) {
+  const excelEpochUTC = Date.UTC(1899, 11, 30);
+  return Math.round((date.getTime() - excelEpochUTC) / 86400000);
+}
+
+// Formatea cualquier valor de celda para mostrar en tabla / CSV / búsqueda.
+function formatCellValue(value) {
+  if (value instanceof Date) {
+    const yyyy = value.getUTCFullYear();
+    const mm = String(value.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(value.getUTCDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  if (typeof value === 'number') return value.toLocaleString('es-CO');
+  if (value === null || value === undefined) return '';
+  return String(value);
+}
+
+// ============================================================================
 // MOTOR DE TRANSFORMACIÓN: nómina "ancha" (bloques por mes) -> formato "largo"
 // ============================================================================
 //
@@ -224,7 +301,7 @@ async function readWorkbookSheetsWithJSZip(file) {
 //     dinámicamente leyendo esa fila de encabezado, no una posición fija.
 //
 // Reglas de negocio aplicadas (confirmadas con el ejemplo real que compartió
-// el equipo):
+// el equipo, Hoja1 -> Hoja2 de BUBBLE_-_Nómina_1.xlsm):
 //   1. Las columnas que son subtotales (PAYMENTS, TOTAL, TOTAL COP, TOTAL USD,
 //      FEE, FEE USD, EXCHANGE RATE, o cualquier encabezado que contenga la
 //      palabra TOTAL) NO se incluyen como "concepto" en el resultado.
@@ -237,6 +314,9 @@ async function readWorkbookSheetsWithJSZip(file) {
 //      valores repetidos) se descartan porque no se pueden atribuir a nadie.
 //   5. Encabezados que son puramente numéricos (residuos de la plantilla) se
 //      ignoran, ya que no son nombres de concepto reales.
+//   6. "Mes elaboración" se entrega como fecha (primer día del mes), tolerando
+//      variaciones de mayúsculas/minúsculas y errores de digitación reales
+//      como "NNOVIEMBRE 2025".
 
 const HEADER_MARKER = /EMPLOYEE\s*CODE/i;
 const NAME_MARKER = /^NAME$/i;
@@ -328,6 +408,11 @@ function parseSheetToLongRows(sheetRows, meta) {
     }
     if (monthLabel === null) monthLabel = `Bloque fila ${i + 1}`;
 
+    // Traducir el rótulo a fecha real; si no se reconoce, se deja el texto
+    // original para no perder el dato y que quede visible que hay que revisarlo.
+    const parsedMonthDate = parseMonthLabelToDate(monthLabel);
+    const mesElaboracion = parsedMonthDate || monthLabel;
+
     // 4. Detectar columnas de concepto y la columna especial de total
     const concepts = []; // { col, name }
     let totalCol = -1;
@@ -371,20 +456,18 @@ function parseSheetToLongRows(sheetRows, meta) {
       }
 
       const empleado = hasName ? String(name).trim() : String(code).trim();
-      const empleadoCodigo = hasCode ? String(code).trim() : '';
 
       for (const concept of concepts) {
         const num = toNumberOrNull(dataRow[concept.col]);
         if (num === null || num === 0) continue; // sin valor -> se excluye
         records.push({
-          Empresa: meta.empresa,
-          Archivo: meta.archivo,
-          Mes: monthLabel,
+          'Mes elaboración': mesElaboracion,
           Concepto: concept.name,
-          'Código Empleado': empleadoCodigo,
           Empleado: empleado,
           'Valor Concepto': num,
-          'Valor Totales': 0
+          'Valor Totales': 0,
+          Empresa: meta.empresa,
+          Archivo: meta.archivo
         });
       }
 
@@ -392,14 +475,13 @@ function parseSheetToLongRows(sheetRows, meta) {
         const totalVal = toNumberOrNull(dataRow[totalCol]);
         if (totalVal !== null && totalVal !== 0) {
           records.push({
-            Empresa: meta.empresa,
-            Archivo: meta.archivo,
-            Mes: monthLabel,
+            'Mes elaboración': mesElaboracion,
             Concepto: SPECIAL_TOTAL_LABEL,
-            'Código Empleado': empleadoCodigo,
             Empleado: empleado,
             'Valor Concepto': 0,
-            'Valor Totales': totalVal
+            'Valor Totales': totalVal,
+            Empresa: meta.empresa,
+            Archivo: meta.archivo
           });
         }
       }
@@ -452,6 +534,8 @@ async function processWorkbookFile(file) {
 // Igual que para leer, generamos a mano el XML mínimo que necesita un .xlsx
 // válido: [Content_Types].xml, _rels/.rels, xl/workbook.xml,
 // xl/_rels/workbook.xml.rels, xl/styles.xml y xl/worksheets/sheet1.xml.
+// El estilo con índice 1 (s="1") aplica formato de fecha yyyy-mm-dd, para que
+// "Mes elaboración" se vea como fecha real en Excel y no como número de serie.
 
 function xmlEscape(value) {
   return String(value)
@@ -491,6 +575,10 @@ function buildSheetXml(dataRows, columns) {
         if (val === null || val === undefined || val === '') {
           return `<c r="${ref}"/>`;
         }
+        if (val instanceof Date) {
+          const serial = excelSerialFromDate(val);
+          return `<c r="${ref}" s="1"><v>${serial}</v></c>`;
+        }
         if (typeof val === 'number') {
           return `<c r="${ref}"><v>${val}</v></c>`;
         }
@@ -518,8 +606,10 @@ async function buildXlsxBlobWithJSZip(dataRows, columns) {
   const workbookRels =
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>';
 
+  // numFmtId 164 = formato de fecha personalizado (yyyy-mm-dd).
+  // cellXfs índice 0 = general (por defecto), índice 1 = fecha.
   const stylesXml =
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>';
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd"/></numFmts><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs></styleSheet>';
 
   const sheetXml = buildSheetXml(dataRows, columns);
 
@@ -539,6 +629,20 @@ async function buildXlsxBlobWithJSZip(dataRows, columns) {
 // ============================================================================
 // COMPONENTE PRINCIPAL
 // ============================================================================
+
+// Columnas de salida, en el orden y con los nombres exactos del ejemplo real
+// (Hoja2 de BUBBLE_-_Nómina_1.xlsm): Mes elaboración, Concepto, Empleado,
+// Valor Concepto, Valor Totales. Empresa y Archivo se agregan al final para
+// poder distinguir las 20+ empresas que se consolidan en un solo archivo.
+const OUTPUT_COLUMNS = [
+  'Mes elaboración',
+  'Concepto',
+  'Empleado',
+  'Valor Concepto',
+  'Valor Totales',
+  'Empresa',
+  'Archivo'
+];
 
 export default function App() {
   const [showInstructions, setShowInstructions] = useState(true);
@@ -598,7 +702,7 @@ export default function App() {
     if (!searchTerm.trim()) return consolidatedRows;
     const term = searchTerm.toLowerCase();
     return consolidatedRows.filter((row) =>
-      Object.values(row).some((val) => String(val).toLowerCase().includes(term))
+      OUTPUT_COLUMNS.some((col) => formatCellValue(row[col]).toLowerCase().includes(term))
     );
   }, [consolidatedRows, searchTerm]);
 
@@ -608,22 +712,11 @@ export default function App() {
     return filteredData.slice(start, start + rowsPerPage);
   }, [filteredData, currentPage]);
 
-  const columns = [
-    'Empresa',
-    'Archivo',
-    'Mes',
-    'Concepto',
-    'Código Empleado',
-    'Empleado',
-    'Valor Concepto',
-    'Valor Totales'
-  ];
-
   const downloadXLSX = async () => {
     if (filteredData.length === 0) return;
     setExporting(true);
     try {
-      const blob = await buildXlsxBlobWithJSZip(filteredData, columns);
+      const blob = await buildXlsxBlobWithJSZip(filteredData, OUTPUT_COLUMNS);
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
@@ -637,9 +730,9 @@ export default function App() {
 
   const downloadCSV = () => {
     if (filteredData.length === 0) return;
-    const headerLine = columns.join(',');
+    const headerLine = OUTPUT_COLUMNS.join(',');
     const lines = filteredData.map((row) =>
-      columns.map((col) => `"${String(row[col] ?? '').replace(/"/g, '""')}"`).join(',')
+      OUTPUT_COLUMNS.map((col) => `"${formatCellValue(row[col]).replace(/"/g, '""')}"`).join(',')
     );
     const csvContent = [headerLine, ...lines].join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -653,7 +746,16 @@ export default function App() {
 
   const downloadJSON = () => {
     if (filteredData.length === 0) return;
-    const blob = new Blob([JSON.stringify(filteredData, null, 2)], {
+    // Las fechas se serializan como "yyyy-mm-dd" en vez del ISO string con
+    // hora que produciría JSON.stringify por defecto sobre un objeto Date.
+    const serializable = filteredData.map((row) => {
+      const obj = {};
+      OUTPUT_COLUMNS.forEach((col) => {
+        obj[col] = row[col] instanceof Date ? formatCellValue(row[col]) : row[col];
+      });
+      return obj;
+    });
+    const blob = new Blob([JSON.stringify(serializable, null, 2)], {
       type: 'application/json'
     });
     const url = URL.createObjectURL(blob);
@@ -727,12 +829,18 @@ export default function App() {
                 o vacíos, y las filas sin empleado identificado.
               </p>
               <p>
-                <strong className="text-slate-900">4. Consolidado:</strong> todos los archivos
-                cargados se acumulan en una sola tabla larga (Empresa, Mes, Concepto, Empleado,
-                Valor). Puedes quitar un archivo si lo subiste por error.
+                <strong className="text-slate-900">4. Mes elaboración:</strong> el mes se convierte
+                a fecha real (primer día del mes), tolerando mayúsculas/minúsculas mezcladas y
+                errores de digitación en el nombre del mes.
               </p>
               <p>
-                <strong className="text-slate-900">5. Exportar:</strong> descarga el resultado en
+                <strong className="text-slate-900">5. Consolidado:</strong> todos los archivos
+                cargados se acumulan en una sola tabla larga (Mes elaboración, Concepto, Empleado,
+                Valor Concepto, Valor Totales, Empresa, Archivo). Puedes quitar un archivo si lo
+                subiste por error.
+              </p>
+              <p>
+                <strong className="text-slate-900">6. Exportar:</strong> descarga el resultado en
                 Excel, CSV o JSON.
               </p>
             </div>
@@ -877,7 +985,7 @@ export default function App() {
               <table className="w-full text-left text-xs text-slate-700">
                 <thead className="bg-slate-100 uppercase text-slate-500 sticky top-0 border-b border-slate-200 font-semibold">
                   <tr>
-                    {columns.map((col) => (
+                    {OUTPUT_COLUMNS.map((col) => (
                       <th key={col} className="px-4 py-3 whitespace-nowrap">
                         {col}
                       </th>
@@ -887,9 +995,9 @@ export default function App() {
                 <tbody className="divide-y divide-slate-100">
                   {paginatedData.map((row, idx) => (
                     <tr key={idx} className="hover:bg-slate-50 transition-colors">
-                      {columns.map((col) => (
+                      {OUTPUT_COLUMNS.map((col) => (
                         <td key={col} className="px-4 py-2.5 whitespace-nowrap">
-                          {typeof row[col] === 'number' ? row[col].toLocaleString('es-CO') : row[col]}
+                          {formatCellValue(row[col])}
                         </td>
                       ))}
                     </tr>
