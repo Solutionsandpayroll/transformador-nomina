@@ -1,0 +1,938 @@
+import React, { useState, useMemo, useCallback } from 'react';
+import JSZip from 'jszip';
+import {
+  Info,
+  ChevronUp,
+  ChevronDown,
+  User,
+  Upload,
+  Download,
+  CheckCircle2,
+  AlertTriangle,
+  Search,
+  ChevronLeft,
+  ChevronRight,
+  FileSpreadsheet,
+  X,
+  FileX2
+} from 'lucide-react';
+
+// ============================================================================
+// LECTOR DE .xlsx / .xlsm CON JSZIP (sin librería xlsx/SheetJS)
+// ============================================================================
+// Un archivo .xlsx/.xlsm es en realidad un .zip con archivos XML adentro.
+// Aquí lo desempacamos con JSZip y leemos a mano los XML que necesitamos:
+//   - xl/workbook.xml            -> lista de hojas y sus IDs de relación
+//   - xl/_rels/workbook.xml.rels -> a qué archivo físico apunta cada hoja
+//   - xl/sharedStrings.xml       -> tabla de textos compartidos (Excel no
+//                                   repite el mismo texto en cada celda, usa
+//                                   un índice a esta tabla)
+//   - xl/worksheets/sheetN.xml   -> las celdas de cada hoja
+
+function colLettersToIndex(letters) {
+  let result = 0;
+  const upper = letters.toUpperCase();
+  for (let i = 0; i < upper.length; i++) {
+    result = result * 26 + (upper.charCodeAt(i) - 64);
+  }
+  return result - 1; // 0-based
+}
+
+function parseCellRef(ref) {
+  const match = /^([A-Za-z]+)(\d+)$/.exec(ref || '');
+  if (!match) return null;
+  return { col: colLettersToIndex(match[1]), row: parseInt(match[2], 10) };
+}
+
+function parseSharedStrings(xmlDoc) {
+  const siNodes = xmlDoc.getElementsByTagName('si');
+  const strings = [];
+  for (let i = 0; i < siNodes.length; i++) {
+    const tNodes = siNodes[i].getElementsByTagName('t');
+    let text = '';
+    for (let j = 0; j < tNodes.length; j++) {
+      text += tNodes[j].textContent;
+    }
+    strings.push(text);
+  }
+  return strings;
+}
+
+function parseWorkbookSheetList(xmlDoc) {
+  const sheetNodes = xmlDoc.getElementsByTagName('sheet');
+  const sheets = [];
+  for (let i = 0; i < sheetNodes.length; i++) {
+    const node = sheetNodes[i];
+    const name = node.getAttribute('name');
+    // El atributo r:id puede venir con o sin el prefijo del namespace
+    const rId =
+      node.getAttribute('r:id') ||
+      node.getAttributeNS(
+        'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+        'id'
+      );
+    sheets.push({ name, rId });
+  }
+  return sheets;
+}
+
+function parseWorkbookRels(xmlDoc) {
+  const relNodes = xmlDoc.getElementsByTagName('Relationship');
+  const map = {};
+  for (let i = 0; i < relNodes.length; i++) {
+    const node = relNodes[i];
+    map[node.getAttribute('Id')] = node.getAttribute('Target');
+  }
+  return map;
+}
+
+function resolveWorksheetPath(target) {
+  // Los targets suelen venir como "worksheets/sheet1.xml" (relativos a xl/)
+  if (target.startsWith('/xl/')) return target.slice(1);
+  if (target.startsWith('xl/')) return target;
+  return `xl/${target}`;
+}
+
+function parseSheetXmlToRows(xmlDoc, sharedStrings) {
+  const rowNodes = xmlDoc.getElementsByTagName('row');
+  const rows = [];
+
+  for (let i = 0; i < rowNodes.length; i++) {
+    const rowNode = rowNodes[i];
+    const rowNumAttr = rowNode.getAttribute('r');
+    const rowIndex = rowNumAttr ? parseInt(rowNumAttr, 10) - 1 : i;
+
+    const cellNodes = rowNode.getElementsByTagName('c');
+    const rowArray = [];
+
+    for (let j = 0; j < cellNodes.length; j++) {
+      const cellNode = cellNodes[j];
+      const ref = cellNode.getAttribute('r');
+      const parsed = ref ? parseCellRef(ref) : null;
+      const colIndex = parsed ? parsed.col : j;
+      const type = cellNode.getAttribute('t');
+
+      let value = null;
+
+      if (type === 'inlineStr') {
+        const isNode = cellNode.getElementsByTagName('is')[0];
+        if (isNode) {
+          const tNodes = isNode.getElementsByTagName('t');
+          let text = '';
+          for (let k = 0; k < tNodes.length; k++) text += tNodes[k].textContent;
+          value = text;
+        }
+      } else {
+        const vNode = cellNode.getElementsByTagName('v')[0];
+        const rawText = vNode ? vNode.textContent : null;
+
+        if (rawText === null || rawText === '') {
+          value = null;
+        } else if (type === 's') {
+          const idx = parseInt(rawText, 10);
+          value = sharedStrings[idx] !== undefined ? sharedStrings[idx] : null;
+        } else if (type === 'b') {
+          value = rawText === '1';
+        } else if (type === 'str' || type === 'e') {
+          value = rawText;
+        } else {
+          // numérico por defecto
+          const num = Number(rawText);
+          value = Number.isFinite(num) ? num : rawText;
+        }
+      }
+
+      rowArray[colIndex] = value;
+    }
+
+    // Rellenar huecos con null para que los índices de columna sean estables
+    for (let c = 0; c < rowArray.length; c++) {
+      if (rowArray[c] === undefined) rowArray[c] = null;
+    }
+
+    rows[rowIndex] = rowArray;
+  }
+
+  // Rellenar filas completamente vacías que Excel omitió (no escribió <row>)
+  for (let r = 0; r < rows.length; r++) {
+    if (!rows[r]) rows[r] = [];
+  }
+
+  return rows;
+}
+
+async function readWorkbookSheetsWithJSZip(file) {
+  const zip = await JSZip.loadAsync(file);
+  const parser = new DOMParser();
+
+  const workbookXmlFile = zip.file('xl/workbook.xml');
+  if (!workbookXmlFile) {
+    throw new Error('El archivo no parece ser un .xlsx/.xlsm válido (falta xl/workbook.xml).');
+  }
+  const workbookXmlText = await workbookXmlFile.async('text');
+  const workbookXmlDoc = parser.parseFromString(workbookXmlText, 'text/xml');
+  const sheetList = parseWorkbookSheetList(workbookXmlDoc);
+
+  const relsFile = zip.file('xl/_rels/workbook.xml.rels');
+  let relsMap = {};
+  if (relsFile) {
+    const relsXmlText = await relsFile.async('text');
+    const relsXmlDoc = parser.parseFromString(relsXmlText, 'text/xml');
+    relsMap = parseWorkbookRels(relsXmlDoc);
+  }
+
+  let sharedStrings = [];
+  const sharedStringsFile = zip.file('xl/sharedStrings.xml');
+  if (sharedStringsFile) {
+    const sharedXmlText = await sharedStringsFile.async('text');
+    const sharedXmlDoc = parser.parseFromString(sharedXmlText, 'text/xml');
+    sharedStrings = parseSharedStrings(sharedXmlDoc);
+  }
+
+  const sheets = [];
+  for (const { name, rId } of sheetList) {
+    const target = relsMap[rId];
+    if (!target) continue;
+    const path = resolveWorksheetPath(target);
+    const sheetFile = zip.file(path);
+    if (!sheetFile) continue;
+
+    const sheetXmlText = await sheetFile.async('text');
+    const sheetXmlDoc = parser.parseFromString(sheetXmlText, 'text/xml');
+    const rows = parseSheetXmlToRows(sheetXmlDoc, sharedStrings);
+    sheets.push({ name, rows });
+  }
+
+  return sheets;
+}
+
+// ============================================================================
+// MOTOR DE TRANSFORMACIÓN: nómina "ancha" (bloques por mes) -> formato "largo"
+// ============================================================================
+//
+// Estructura que este motor espera encontrar en cada hoja de un archivo:
+//   - En algún punto de la hoja aparece una fila que contiene la etiqueta
+//     "EMPLOYEE CODE" (o similar) en alguna columna, seguida de "NAME" en la
+//     columna siguiente. Esa fila es el "encabezado" de un bloque de mes.
+//   - El nombre del mes suele estar en la columna A de esa misma fila o de la
+//     fila inmediatamente anterior (categorías como PAYROLL, TOTALS, etc.)
+//   - Después del encabezado vienen 1 o más filas con datos de empleados,
+//     hasta que aparece una fila completamente vacía (separador) o el
+//     encabezado del siguiente bloque.
+//   - Cada bloque puede tener columnas de "conceptos" distintas (un mes trae
+//     una prima, otro no la trae, etc.), así que las columnas se detectan
+//     dinámicamente leyendo esa fila de encabezado, no una posición fija.
+//
+// Reglas de negocio aplicadas (confirmadas con el ejemplo real que compartió
+// el equipo):
+//   1. Las columnas que son subtotales (PAYMENTS, TOTAL, TOTAL COP, TOTAL USD,
+//      FEE, FEE USD, EXCHANGE RATE, o cualquier encabezado que contenga la
+//      palabra TOTAL) NO se incluyen como "concepto" en el resultado.
+//   2. La columna "TOTAL EMPLOYEE COST" es la única excepción: se convierte en
+//      una fila especial cuyo valor va en "Valor Totales" en vez de
+//      "Valor Concepto".
+//   3. Los conceptos sin valor, vacíos o en cero NO generan fila en el
+//      resultado.
+//   4. Las filas "fantasma" (sin código de empleado y sin nombre, pero con
+//      valores repetidos) se descartan porque no se pueden atribuir a nadie.
+//   5. Encabezados que son puramente numéricos (residuos de la plantilla) se
+//      ignoran, ya que no son nombres de concepto reales.
+
+const HEADER_MARKER = /EMPLOYEE\s*CODE/i;
+const NAME_MARKER = /^NAME$/i;
+const SPECIAL_TOTAL_LABEL = 'TOTAL EMPLOYEE COST';
+
+const BLACKLIST_EXACT = new Set([
+  'PAYMENTS',
+  'FEE',
+  'FEE USD',
+  'EXCHANGE RATE',
+  'EMPLOYEE CODE',
+  'NAME'
+]);
+
+function normalizeHeader(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).trim().toUpperCase();
+}
+
+function isNumericLabel(value) {
+  if (value === null || value === undefined) return false;
+  return /^-?\d+(\.\d+)?$/.test(String(value).trim());
+}
+
+function isBlacklistedConcept(normalized) {
+  if (normalized === SPECIAL_TOTAL_LABEL) return false;
+  if (BLACKLIST_EXACT.has(normalized)) return true;
+  if (normalized.includes('TOTAL')) return true;
+  return false;
+}
+
+function isRowBlank(row, fromCol, toCol) {
+  for (let c = fromCol; c <= toCol; c++) {
+    const v = row[c];
+    if (v !== null && v !== undefined && String(v).trim() !== '') return false;
+  }
+  return true;
+}
+
+function toNumberOrNull(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = typeof value === 'number' ? value : Number(String(value).replace(/,/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+// Convierte una hoja (array de arrays) en filas largas.
+function parseSheetToLongRows(sheetRows, meta) {
+  const records = [];
+  const n = sheetRows.length;
+  let i = 0;
+
+  while (i < n) {
+    const row = sheetRows[i] || [];
+
+    // 1. Buscar la columna que contiene "EMPLOYEE CODE" en esta fila
+    let codeCol = -1;
+    for (let j = 0; j < row.length; j++) {
+      if (row[j] !== null && row[j] !== undefined && HEADER_MARKER.test(String(row[j]))) {
+        codeCol = j;
+        break;
+      }
+    }
+
+    if (codeCol === -1) {
+      i += 1;
+      continue;
+    }
+
+    // 2. La columna de nombre normalmente es la siguiente; si no calza,
+    //    buscarla en el resto de la fila.
+    let nameCol = codeCol + 1;
+    if (!(row[nameCol] !== undefined && NAME_MARKER.test(String(row[nameCol] || '').trim()))) {
+      for (let j = codeCol + 1; j < row.length; j++) {
+        if (NAME_MARKER.test(String(row[j] || '').trim())) {
+          nameCol = j;
+          break;
+        }
+      }
+    }
+
+    // 3. Etiqueta del mes: columna A de esta fila, o de hasta 2 filas arriba
+    let monthLabel = null;
+    for (let back = 0; back <= 2 && monthLabel === null; back++) {
+      const candidateRow = sheetRows[i - back];
+      const candidate = candidateRow ? candidateRow[0] : null;
+      if (candidate !== null && candidate !== undefined && String(candidate).trim() !== '') {
+        monthLabel = String(candidate).trim();
+      }
+    }
+    if (monthLabel === null) monthLabel = `Bloque fila ${i + 1}`;
+
+    // 4. Detectar columnas de concepto y la columna especial de total
+    const concepts = []; // { col, name }
+    let totalCol = -1;
+    for (let j = nameCol + 1; j < row.length; j++) {
+      const raw = row[j];
+      if (raw === null || raw === undefined || String(raw).trim() === '') continue;
+      if (isNumericLabel(raw)) continue;
+      const normalized = normalizeHeader(raw);
+      if (normalized === SPECIAL_TOTAL_LABEL) {
+        totalCol = j;
+      } else if (isBlacklistedConcept(normalized)) {
+        continue;
+      } else {
+        concepts.push({ col: j, name: String(raw).trim() });
+      }
+    }
+
+    const lastRelevantCol = Math.max(
+      nameCol,
+      totalCol,
+      ...concepts.map((c) => c.col),
+      codeCol
+    );
+
+    // 5. Recorrer las filas de datos del bloque hasta encontrar una fila
+    //    vacía (separador) o el final de la hoja.
+    let k = i + 1;
+    while (k < n) {
+      const dataRow = sheetRows[k] || [];
+      if (isRowBlank(dataRow, codeCol, lastRelevantCol)) break;
+
+      const code = dataRow[codeCol];
+      const name = dataRow[nameCol];
+      const hasCode = code !== null && code !== undefined && String(code).trim() !== '';
+      const hasName = name !== null && name !== undefined && String(name).trim() !== '';
+
+      if (!hasCode && !hasName) {
+        // Fila fantasma / duplicada sin identificar a nadie: se descarta.
+        k += 1;
+        continue;
+      }
+
+      const empleado = hasName ? String(name).trim() : String(code).trim();
+      const empleadoCodigo = hasCode ? String(code).trim() : '';
+
+      for (const concept of concepts) {
+        const num = toNumberOrNull(dataRow[concept.col]);
+        if (num === null || num === 0) continue; // sin valor -> se excluye
+        records.push({
+          Empresa: meta.empresa,
+          Archivo: meta.archivo,
+          Mes: monthLabel,
+          Concepto: concept.name,
+          'Código Empleado': empleadoCodigo,
+          Empleado: empleado,
+          'Valor Concepto': num,
+          'Valor Totales': 0
+        });
+      }
+
+      if (totalCol !== -1) {
+        const totalVal = toNumberOrNull(dataRow[totalCol]);
+        if (totalVal !== null && totalVal !== 0) {
+          records.push({
+            Empresa: meta.empresa,
+            Archivo: meta.archivo,
+            Mes: monthLabel,
+            Concepto: SPECIAL_TOTAL_LABEL,
+            'Código Empleado': empleadoCodigo,
+            Empleado: empleado,
+            'Valor Concepto': 0,
+            'Valor Totales': totalVal
+          });
+        }
+      }
+
+      k += 1;
+    }
+
+    i = k;
+  }
+
+  return records;
+}
+
+function companyNameFromFileName(fileName) {
+  return fileName.replace(/\.[^/.]+$/, '');
+}
+
+async function processWorkbookFile(file) {
+  const sheets = await readWorkbookSheetsWithJSZip(file);
+  const empresa = companyNameFromFileName(file.name);
+  let allRecords = [];
+  let sheetsUsed = 0;
+
+  for (const { rows } of sheets) {
+    const hasMarker = rows.some((row) =>
+      (row || []).some((cell) => cell !== null && HEADER_MARKER.test(String(cell)))
+    );
+    if (!hasMarker) continue;
+
+    sheetsUsed += 1;
+    const records = parseSheetToLongRows(rows, { empresa, archivo: file.name });
+    allRecords = allRecords.concat(records);
+  }
+
+  return {
+    fileId: `${file.name}-${file.size}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    fileName: file.name,
+    empresa,
+    rows: allRecords,
+    warning:
+      sheetsUsed === 0
+        ? 'No se encontró en ninguna hoja el patrón de nómina esperado (una fila con "EMPLOYEE CODE"). Revisa que sea el archivo correcto.'
+        : null
+  };
+}
+
+// ============================================================================
+// ESCRITOR DE .xlsx CON JSZIP (para la descarga del resultado)
+// ============================================================================
+// Igual que para leer, generamos a mano el XML mínimo que necesita un .xlsx
+// válido: [Content_Types].xml, _rels/.rels, xl/workbook.xml,
+// xl/_rels/workbook.xml.rels, xl/styles.xml y xl/worksheets/sheet1.xml.
+
+function xmlEscape(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function colIndexToLetters(index) {
+  let n = index + 1;
+  let s = '';
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+function buildSheetXml(dataRows, columns) {
+  const headerCells = columns
+    .map((colName, idx) => {
+      const ref = `${colIndexToLetters(idx)}1`;
+      return `<c r="${ref}" t="inlineStr"><is><t>${xmlEscape(colName)}</t></is></c>`;
+    })
+    .join('');
+  let xmlRows = `<row r="1">${headerCells}</row>`;
+
+  dataRows.forEach((row, rIdx) => {
+    const rowNum = rIdx + 2;
+    const cells = columns
+      .map((colName, cIdx) => {
+        const ref = `${colIndexToLetters(cIdx)}${rowNum}`;
+        const val = row[colName];
+        if (val === null || val === undefined || val === '') {
+          return `<c r="${ref}"/>`;
+        }
+        if (typeof val === 'number') {
+          return `<c r="${ref}"><v>${val}</v></c>`;
+        }
+        return `<c r="${ref}" t="inlineStr"><is><t>${xmlEscape(String(val))}</t></is></c>`;
+      })
+      .join('');
+    xmlRows += `<row r="${rowNum}">${cells}</row>`;
+  });
+
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${xmlRows}</sheetData></worksheet>`;
+}
+
+async function buildXlsxBlobWithJSZip(dataRows, columns) {
+  const zip = new JSZip();
+
+  const contentTypes =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>';
+
+  const rootRels =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>';
+
+  const workbookXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Nomina largo" sheetId="1" r:id="rId1"/></sheets></workbook>';
+
+  const workbookRels =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>';
+
+  const stylesXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>';
+
+  const sheetXml = buildSheetXml(dataRows, columns);
+
+  zip.file('[Content_Types].xml', contentTypes);
+  zip.file('_rels/.rels', rootRels);
+  zip.file('xl/workbook.xml', workbookXml);
+  zip.file('xl/_rels/workbook.xml.rels', workbookRels);
+  zip.file('xl/styles.xml', stylesXml);
+  zip.file('xl/worksheets/sheet1.xml', sheetXml);
+
+  return zip.generateAsync({
+    type: 'blob',
+    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  });
+}
+
+// ============================================================================
+// COMPONENTE PRINCIPAL
+// ============================================================================
+
+export default function App() {
+  const [showInstructions, setShowInstructions] = useState(true);
+  const [files, setFiles] = useState([]); // { fileId, fileName, empresa, rows, warning }
+  const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [currentPage, setCurrentPage] = useState(1);
+  const rowsPerPage = 10;
+
+  const consolidatedRows = useMemo(() => files.flatMap((f) => f.rows), [files]);
+
+  const handleFileUpload = async (e) => {
+    const uploaded = Array.from(e.target.files || []);
+    if (uploaded.length === 0) return;
+
+    setLoading(true);
+    setSearchTerm('');
+    setCurrentPage(1);
+
+    try {
+      const results = [];
+      for (const file of uploaded) {
+        try {
+          const result = await processWorkbookFile(file);
+          results.push(result);
+        } catch (err) {
+          console.error('Error procesando', file.name, err);
+          results.push({
+            fileId: `${file.name}-${Date.now()}`,
+            fileName: file.name,
+            empresa: companyNameFromFileName(file.name),
+            rows: [],
+            warning: 'No se pudo leer este archivo. ¿Es un .xlsx/.xlsm válido?'
+          });
+        }
+      }
+      setFiles((prev) => [...prev, ...results]);
+    } finally {
+      setLoading(false);
+      e.target.value = '';
+    }
+  };
+
+  const removeFile = useCallback((fileId) => {
+    setFiles((prev) => prev.filter((f) => f.fileId !== fileId));
+    setCurrentPage(1);
+  }, []);
+
+  const clearAll = () => {
+    setFiles([]);
+    setSearchTerm('');
+    setCurrentPage(1);
+  };
+
+  const filteredData = useMemo(() => {
+    if (!searchTerm.trim()) return consolidatedRows;
+    const term = searchTerm.toLowerCase();
+    return consolidatedRows.filter((row) =>
+      Object.values(row).some((val) => String(val).toLowerCase().includes(term))
+    );
+  }, [consolidatedRows, searchTerm]);
+
+  const totalPages = Math.ceil(filteredData.length / rowsPerPage) || 1;
+  const paginatedData = useMemo(() => {
+    const start = (currentPage - 1) * rowsPerPage;
+    return filteredData.slice(start, start + rowsPerPage);
+  }, [filteredData, currentPage]);
+
+  const columns = [
+    'Empresa',
+    'Archivo',
+    'Mes',
+    'Concepto',
+    'Código Empleado',
+    'Empleado',
+    'Valor Concepto',
+    'Valor Totales'
+  ];
+
+  const downloadXLSX = async () => {
+    if (filteredData.length === 0) return;
+    setExporting(true);
+    try {
+      const blob = await buildXlsxBlobWithJSZip(filteredData, columns);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'nomina_formato_largo.xlsx';
+      link.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const downloadCSV = () => {
+    if (filteredData.length === 0) return;
+    const headerLine = columns.join(',');
+    const lines = filteredData.map((row) =>
+      columns.map((col) => `"${String(row[col] ?? '').replace(/"/g, '""')}"`).join(',')
+    );
+    const csvContent = [headerLine, ...lines].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'nomina_formato_largo.csv';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadJSON = () => {
+    if (filteredData.length === 0) return;
+    const blob = new Blob([JSON.stringify(filteredData, null, 2)], {
+      type: 'application/json'
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'nomina_formato_largo.json';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const totalWarnings = files.filter((f) => f.warning).length;
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans">
+      {/* Header */}
+      <header className="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between shadow-sm">
+        <div className="flex items-center gap-3">
+          <img src="/logo.jpeg" alt="Logo" className="h-14 w-auto object-contain cursor-pointer" />
+        </div>
+        <div className="flex items-center gap-2.5 border border-slate-200 bg-slate-50 px-5 py-2 rounded-full text-sm font-semibold text-slate-700 cursor-pointer hover:bg-slate-100 transition-colors">
+          <User className="w-4 h-4 text-blue-600" />
+          <span>Bienvenido Usuario</span>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto px-6 py-10 space-y-8">
+        {/* Título */}
+        <div className="text-center space-y-3">
+          <h1 className="text-3xl font-extrabold text-slate-900 tracking-tight">
+            Transformador de Nómina: Ancho → Largo
+          </h1>
+          <p className="text-sm text-slate-600 max-w-2xl mx-auto leading-relaxed">
+            Carga uno o varios archivos de nómina (.xlsx / .xlsm) tal como los envía cada empresa.
+            La herramienta detecta automáticamente los bloques por mes, filtra los conceptos sin
+            valor y consolida todo en un único formato largo listo para el cruce contra Siigo.
+          </p>
+        </div>
+
+        {/* Instrucciones */}
+        <div className="bg-blue-50/60 border border-blue-200/80 rounded-2xl overflow-hidden transition-all duration-200 shadow-sm">
+          <button
+            onClick={() => setShowInstructions(!showInstructions)}
+            className="w-full px-6 py-4 flex items-center justify-between text-left hover:bg-blue-100/30 transition-colors cursor-pointer"
+          >
+            <div className="flex items-center gap-3 text-blue-900 font-bold text-base">
+              <Info className="w-5 h-5 text-blue-600 shrink-0" />
+              <span>¿Cómo usar esta herramienta?</span>
+            </div>
+            {showInstructions ? (
+              <ChevronUp className="w-5 h-5 text-blue-800" />
+            ) : (
+              <ChevronDown className="w-5 h-5 text-blue-800" />
+            )}
+          </button>
+          {showInstructions && (
+            <div className="px-6 pb-6 pt-2 border-t border-blue-100 text-xs text-slate-700 space-y-2.5 leading-relaxed">
+              <p>
+                <strong className="text-slate-900">1. Cargar archivos:</strong> puedes seleccionar
+                varios archivos a la vez (una empresa puede tener varios .xlsx por mes, o puedes
+                subir varias empresas juntas).
+              </p>
+              <p>
+                <strong className="text-slate-900">2. Detección automática:</strong> la herramienta
+                busca en cada hoja los bloques que contienen "EMPLOYEE CODE" / "NAME" y a partir de
+                ahí identifica el mes y los conceptos de esa nómina, sin importar cuántas columnas
+                traiga cada una.
+              </p>
+              <p>
+                <strong className="text-slate-900">3. Filtros de calidad:</strong> se excluyen
+                automáticamente los subtotales (Payments, Total, Fee, etc.), los conceptos en cero
+                o vacíos, y las filas sin empleado identificado.
+              </p>
+              <p>
+                <strong className="text-slate-900">4. Consolidado:</strong> todos los archivos
+                cargados se acumulan en una sola tabla larga (Empresa, Mes, Concepto, Empleado,
+                Valor). Puedes quitar un archivo si lo subiste por error.
+              </p>
+              <p>
+                <strong className="text-slate-900">5. Exportar:</strong> descarga el resultado en
+                Excel, CSV o JSON.
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Zona de carga */}
+        <div className="bg-white border-2 border-dashed border-slate-300 rounded-2xl p-10 shadow-sm text-center relative hover:border-blue-500 transition-colors cursor-pointer">
+          <input
+            type="file"
+            accept=".xlsx,.xlsm"
+            multiple
+            onChange={handleFileUpload}
+            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+          />
+          <div className="flex flex-col items-center gap-3">
+            <div className="p-4 bg-blue-50 text-blue-600 rounded-full">
+              <Upload className="w-7 h-7" />
+            </div>
+            <div>
+              <p className="font-semibold text-base text-slate-800">
+                Arrastra tus archivos de nómina (.xlsx / .xlsm) o haz clic para buscar
+              </p>
+              <p className="text-xs text-slate-500 mt-1">
+                Puedes seleccionar varios archivos a la vez — se van sumando al consolidado
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {loading && (
+          <div className="flex items-center justify-center gap-2 text-blue-700 py-4">
+            <div className="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
+            <span className="text-xs font-medium">Leyendo y transformando archivos...</span>
+          </div>
+        )}
+
+        {/* Lista de archivos cargados */}
+        {files.length > 0 && !loading && (
+          <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-4 space-y-2">
+            <div className="flex items-center justify-between mb-1">
+              <h2 className="text-sm font-bold text-slate-800">
+                Archivos cargados ({files.length})
+              </h2>
+              <button
+                onClick={clearAll}
+                className="text-xs font-medium text-slate-500 hover:text-red-600 transition-colors cursor-pointer"
+              >
+                Quitar todos
+              </button>
+            </div>
+            {files.map((f) => (
+              <div
+                key={f.fileId}
+                className={`flex items-center justify-between gap-3 px-3 py-2 rounded-lg border text-xs ${
+                  f.warning ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-200'
+                }`}
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  {f.warning ? (
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                  ) : (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  )}
+                  <div className="min-w-0">
+                    <p className="font-semibold text-slate-800 truncate">{f.fileName}</p>
+                    <p className="text-slate-500">
+                      {f.warning
+                        ? f.warning
+                        : `${f.rows.length} filas generadas · Empresa: ${f.empresa}`}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => removeFile(f.fileId)}
+                  className="p-1 rounded hover:bg-white text-slate-400 hover:text-red-600 transition-colors cursor-pointer shrink-0"
+                  title="Quitar este archivo"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            ))}
+            {totalWarnings > 0 && (
+              <p className="text-xs text-amber-700 pt-1">
+                {totalWarnings} archivo(s) no generaron filas — revisa que sean del formato
+                esperado.
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Tabla consolidada */}
+        {consolidatedRows.length > 0 && !loading && (
+          <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+            <div className="p-4 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-center gap-2 text-emerald-600 text-xs font-semibold">
+                <CheckCircle2 className="w-4 h-4" />
+                <span>{filteredData.length} registros consolidados</span>
+              </div>
+
+              <div className="relative flex-1 max-w-xs">
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder="Buscar empleado, concepto, mes..."
+                  value={searchTerm}
+                  onChange={(e) => {
+                    setSearchTerm(e.target.value);
+                    setCurrentPage(1);
+                  }}
+                  className="w-full pl-9 pr-3 py-1.5 text-xs bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={downloadXLSX}
+                  disabled={exporting}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-900 hover:bg-blue-800 disabled:opacity-50 text-white font-medium text-xs rounded-lg transition-colors cursor-pointer"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  {exporting ? 'Generando...' : 'Excel'}
+                </button>
+                <button
+                  onClick={downloadCSV}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white font-medium text-xs rounded-lg transition-colors cursor-pointer"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  CSV
+                </button>
+                <button
+                  onClick={downloadJSON}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-slate-800 text-white font-medium text-xs rounded-lg transition-colors cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  JSON
+                </button>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto max-h-96">
+              <table className="w-full text-left text-xs text-slate-700">
+                <thead className="bg-slate-100 uppercase text-slate-500 sticky top-0 border-b border-slate-200 font-semibold">
+                  <tr>
+                    {columns.map((col) => (
+                      <th key={col} className="px-4 py-3 whitespace-nowrap">
+                        {col}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {paginatedData.map((row, idx) => (
+                    <tr key={idx} className="hover:bg-slate-50 transition-colors">
+                      {columns.map((col) => (
+                        <td key={col} className="px-4 py-2.5 whitespace-nowrap">
+                          {typeof row[col] === 'number' ? row[col].toLocaleString('es-CO') : row[col]}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="p-3 bg-slate-50 border-t border-slate-200 flex items-center justify-between text-xs text-slate-600">
+              <span>
+                Página {currentPage} de {totalPages}
+              </span>
+              <div className="flex items-center gap-1">
+                <button
+                  disabled={currentPage === 1}
+                  onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
+                  className="p-1.5 rounded border border-slate-200 hover:bg-white disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+                <button
+                  disabled={currentPage === totalPages}
+                  onClick={() => setCurrentPage((prev) => Math.min(prev + 1, totalPages))}
+                  className="p-1.5 rounded border border-slate-200 hover:bg-white disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {files.length > 0 && consolidatedRows.length === 0 && !loading && (
+          <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-10 text-center space-y-2">
+            <FileX2 className="w-8 h-8 text-slate-300 mx-auto" />
+            <p className="text-sm font-semibold text-slate-700">Ningún archivo generó registros</p>
+            <p className="text-xs text-slate-500">
+              Revisa los mensajes de advertencia arriba: probablemente el archivo no trae la
+              etiqueta "EMPLOYEE CODE" que la herramienta usa para detectar el formato.
+            </p>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
