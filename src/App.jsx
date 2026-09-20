@@ -16,6 +16,7 @@ import {
   X,
   FileX2
 } from 'lucide-react';
+import { convertSiigoRows } from './siigoConverter';
 
 // ============================================================================
 // LECTOR DE .xlsx / .xlsm CON JSZIP (sin librería xlsx/SheetJS)
@@ -284,7 +285,7 @@ function formatCellValue(value) {
 }
 
 // ============================================================================
-// MOTOR DE TRANSFORMACIÓN: nómina "ancha" (bloques por mes) -> formato "largo"
+// MODO 1 — MOTOR DE TRANSFORMACIÓN: nómina "ancha" (bloques por mes) -> "largo"
 // ============================================================================
 //
 // Estructura que este motor espera encontrar en cada hoja de un archivo:
@@ -317,6 +318,11 @@ function formatCellValue(value) {
 //   6. "Mes elaboración" se entrega como fecha (primer día del mes), tolerando
 //      variaciones de mayúsculas/minúsculas y errores de digitación reales
 //      como "NNOVIEMBRE 2025".
+//   7. (NUEVO) Las columnas que no son montos (fechas de ingreso, país, estado,
+//      tipo de servicio, % de aportes...) se ignoran.
+//   8. (NUEVO) El nombre del empleado se unifica por código de empleado: se usa
+//      el del último bloque de la hoja, así todos los meses salen igual aunque
+//      el archivo cambie el orden "NOMBRE APELLIDOS" / "APELLIDOS NOMBRE".
 
 const HEADER_MARKER = /EMPLOYEE\s*CODE/i;
 const NAME_MARKER = /^NAME$/i;
@@ -330,6 +336,11 @@ const BLACKLIST_EXACT = new Set([
   'EMPLOYEE CODE',
   'NAME'
 ]);
+
+// Encabezados que traen datos que no son dinero (evita filas como
+// "Onboarding Date | 45658.2085").
+const NON_MONETARY =
+  /(DATE|STATUS|COUNTRY|PAYROLL MONTH|SERVICE TYPE|INVOICE TYPE|RATE\s*%|EE RF WID)/i;
 
 function normalizeHeader(value) {
   if (value === null || value === undefined) return '';
@@ -365,6 +376,7 @@ function toNumberOrNull(value) {
 // Convierte una hoja (array de arrays) en filas largas.
 function parseSheetToLongRows(sheetRows, meta) {
   const records = [];
+  const latestNameByCode = new Map(); // código de empleado -> último nombre visto
   const n = sheetRows.length;
   let i = 0;
 
@@ -423,7 +435,7 @@ function parseSheetToLongRows(sheetRows, meta) {
       const normalized = normalizeHeader(raw);
       if (normalized === SPECIAL_TOTAL_LABEL) {
         totalCol = j;
-      } else if (isBlacklistedConcept(normalized)) {
+      } else if (isBlacklistedConcept(normalized) || NON_MONETARY.test(normalized)) {
         continue;
       } else {
         concepts.push({ col: j, name: String(raw).trim() });
@@ -456,6 +468,8 @@ function parseSheetToLongRows(sheetRows, meta) {
       }
 
       const empleado = hasName ? String(name).trim() : String(code).trim();
+      const codigo = hasCode ? String(code).replace(/\D/g, '') : '';
+      if (codigo) latestNameByCode.set(codigo, empleado);
 
       for (const concept of concepts) {
         const num = toNumberOrNull(dataRow[concept.col]);
@@ -467,7 +481,8 @@ function parseSheetToLongRows(sheetRows, meta) {
           'Valor Concepto': num,
           'Valor Totales': 0,
           Empresa: meta.empresa,
-          Archivo: meta.archivo
+          Archivo: meta.archivo,
+          _codigo: codigo
         });
       }
 
@@ -481,7 +496,8 @@ function parseSheetToLongRows(sheetRows, meta) {
             'Valor Concepto': 0,
             'Valor Totales': totalVal,
             Empresa: meta.empresa,
-            Archivo: meta.archivo
+            Archivo: meta.archivo,
+            _codigo: codigo
           });
         }
       }
@@ -492,6 +508,14 @@ function parseSheetToLongRows(sheetRows, meta) {
     i = k;
   }
 
+  // Unificar el nombre por código de empleado (regla 8) y limpiar el campo interno.
+  records.forEach((r) => {
+    if (r._codigo && latestNameByCode.has(r._codigo)) {
+      r.Empleado = latestNameByCode.get(r._codigo);
+    }
+    delete r._codigo;
+  });
+
   return records;
 }
 
@@ -499,9 +523,12 @@ function companyNameFromFileName(fileName) {
   return fileName.replace(/\.[^/.]+$/, '');
 }
 
-async function processWorkbookFile(file) {
-  const sheets = await readWorkbookSheetsWithJSZip(file);
-  const empresa = companyNameFromFileName(file.name);
+function newFileId(file) {
+  return `${file.name}-${file.size}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// --- Modo 1: nómina ancha ---------------------------------------------------
+function processWideWorkbook(file, sheets, empresa) {
   let allRecords = [];
   let sheetsUsed = 0;
 
@@ -517,15 +544,54 @@ async function processWorkbookFile(file) {
   }
 
   return {
-    fileId: `${file.name}-${file.size}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    fileId: newFileId(file),
     fileName: file.name,
     empresa,
     rows: allRecords,
+    notes: [],
     warning:
       sheetsUsed === 0
         ? 'No se encontró en ninguna hoja el patrón de nómina esperado (una fila con "EMPLOYEE CODE"). Revisa que sea el archivo correcto.'
         : null
   };
+}
+
+// --- Modo 2: Movimiento CC de Siigo -----------------------------------------
+function processSiigoWorkbook(file, sheets, empresa) {
+  let converted = null;
+  for (const { rows } of sheets) {
+    const result = convertSiigoRows(rows);
+    if (result) {
+      converted = result;
+      break; // la primera hoja con encabezado de Movimiento CC (las demás son auxiliares)
+    }
+  }
+
+  let warning = null;
+  if (!converted) {
+    warning =
+      'No se encontró el encabezado de un Movimiento CC de Siigo (Comprobante, Fecha elaboración, Descripción, Débito, Crédito). Revisa que sea el archivo correcto.';
+  } else if (converted.records.length === 0) {
+    warning =
+      'Se encontró el Movimiento CC, pero ninguna línea de nómina reconocible (comprobantes CC-*).';
+  }
+
+  return {
+    fileId: newFileId(file),
+    fileName: file.name,
+    empresa,
+    rows: converted ? converted.records : [],
+    notes: converted ? converted.notes : [],
+    warning
+  };
+}
+
+async function processWorkbookFile(file, mode) {
+  const sheets = await readWorkbookSheetsWithJSZip(file);
+  const empresa = companyNameFromFileName(file.name);
+  return mode === 'siigo'
+    ? processSiigoWorkbook(file, sheets, empresa)
+    : processWideWorkbook(file, sheets, empresa);
 }
 
 // ============================================================================
@@ -534,8 +600,8 @@ async function processWorkbookFile(file) {
 // Igual que para leer, generamos a mano el XML mínimo que necesita un .xlsx
 // válido: [Content_Types].xml, _rels/.rels, xl/workbook.xml,
 // xl/_rels/workbook.xml.rels, xl/styles.xml y xl/worksheets/sheet1.xml.
-// El estilo con índice 1 (s="1") aplica formato de fecha yyyy-mm-dd, para que
-// "Mes elaboración" se vea como fecha real en Excel y no como número de serie.
+// Estilos (atributo s): 1 = fecha yyyy-mm-dd; 2 = número con relleno verde
+// (viene de Siigo); 3 = número con relleno amarillo (calculado).
 
 function xmlEscape(value) {
   return String(value)
@@ -556,6 +622,8 @@ function colIndexToLetters(index) {
   }
   return s;
 }
+
+const VALUE_COLUMNS = new Set(['Valor Concepto', 'Valor Totales']);
 
 function buildSheetXml(dataRows, columns) {
   const headerCells = columns
@@ -580,6 +648,10 @@ function buildSheetXml(dataRows, columns) {
           return `<c r="${ref}" s="1"><v>${serial}</v></c>`;
         }
         if (typeof val === 'number') {
+          if (row._fill && VALUE_COLUMNS.has(colName)) {
+            const style = row._fill === 'yellow' ? 3 : 2;
+            return `<c r="${ref}" s="${style}"><v>${val}</v></c>`;
+          }
           return `<c r="${ref}"><v>${val}</v></c>`;
         }
         return `<c r="${ref}" t="inlineStr"><is><t>${xmlEscape(String(val))}</t></is></c>`;
@@ -606,10 +678,11 @@ async function buildXlsxBlobWithJSZip(dataRows, columns) {
   const workbookRels =
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>';
 
-  // numFmtId 164 = formato de fecha personalizado (yyyy-mm-dd).
-  // cellXfs índice 0 = general (por defecto), índice 1 = fecha.
+  // numFmtId 164 = fecha personalizada (yyyy-mm-dd); numFmtId 4 = #,##0.00 (integrado).
+  // fills: 0 = ninguno, 1 = gray125 (obligatorio), 2 = verde, 3 = amarillo.
+  // cellXfs: 0 = general, 1 = fecha, 2 = número verde, 3 = número amarillo.
   const stylesXml =
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd"/></numFmts><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs></styleSheet>';
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd"/></numFmts><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="4"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF92D050"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="4" fontId="0" fillId="2" borderId="0" xfId="0" applyNumberFormat="1" applyFill="1"/><xf numFmtId="4" fontId="0" fillId="3" borderId="0" xfId="0" applyNumberFormat="1" applyFill="1"/></cellXfs></styleSheet>';
 
   const sheetXml = buildSheetXml(dataRows, columns);
 
@@ -632,28 +705,47 @@ async function buildXlsxBlobWithJSZip(dataRows, columns) {
 
 // Columnas de salida, en el orden y con los nombres exactos del ejemplo real
 // (Hoja2 de BUBBLE_-_Nómina_1.xlsm): Mes elaboración, Concepto, Empleado,
-// Valor Concepto, Valor Totales. Empresa y Archivo se agregan al final para
-// poder distinguir las 20+ empresas que se consolidan en un solo archivo.
-const OUTPUT_COLUMNS = [
+// Valor Concepto, Valor Totales.
+const BASE_COLUMNS = [
   'Mes elaboración',
   'Concepto',
   'Empleado',
   'Valor Concepto',
-  'Valor Totales',
-  'Empresa',
-  'Archivo'
+  'Valor Totales'
 ];
+// Modo 1 agrega Empresa y Archivo para distinguir las 20+ empresas que se
+// consolidan en un solo archivo. Modo 2 (Siigo) sale con las 5 columnas exactas.
+const COLUMNS_BY_MODE = {
+  nomina: [...BASE_COLUMNS, 'Empresa', 'Archivo'],
+  siigo: BASE_COLUMNS
+};
+
+const FILL_CLASS = {
+  green: 'bg-green-300',
+  yellow: 'bg-yellow-300'
+};
 
 export default function App() {
+  const [mode, setMode] = useState('nomina'); // 'nomina' | 'siigo'
   const [showInstructions, setShowInstructions] = useState(true);
-  const [files, setFiles] = useState([]); // { fileId, fileName, empresa, rows, warning }
+  const [files, setFiles] = useState([]); // { fileId, fileName, empresa, rows, notes, warning }
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const rowsPerPage = 10;
 
+  const outputColumns = COLUMNS_BY_MODE[mode];
   const consolidatedRows = useMemo(() => files.flatMap((f) => f.rows), [files]);
+
+  const changeMode = (nextMode) => {
+    if (nextMode === mode) return;
+    // Los dos modos generan tablas distintas: se limpia para no mezclarlas.
+    setMode(nextMode);
+    setFiles([]);
+    setSearchTerm('');
+    setCurrentPage(1);
+  };
 
   const handleFileUpload = async (e) => {
     const uploaded = Array.from(e.target.files || []);
@@ -667,7 +759,7 @@ export default function App() {
       const results = [];
       for (const file of uploaded) {
         try {
-          const result = await processWorkbookFile(file);
+          const result = await processWorkbookFile(file, mode);
           results.push(result);
         } catch (err) {
           console.error('Error procesando', file.name, err);
@@ -676,6 +768,7 @@ export default function App() {
             fileName: file.name,
             empresa: companyNameFromFileName(file.name),
             rows: [],
+            notes: [],
             warning: 'No se pudo leer este archivo. ¿Es un .xlsx/.xlsm válido?'
           });
         }
@@ -702,9 +795,9 @@ export default function App() {
     if (!searchTerm.trim()) return consolidatedRows;
     const term = searchTerm.toLowerCase();
     return consolidatedRows.filter((row) =>
-      OUTPUT_COLUMNS.some((col) => formatCellValue(row[col]).toLowerCase().includes(term))
+      outputColumns.some((col) => formatCellValue(row[col]).toLowerCase().includes(term))
     );
-  }, [consolidatedRows, searchTerm]);
+  }, [consolidatedRows, searchTerm, outputColumns]);
 
   const totalPages = Math.ceil(filteredData.length / rowsPerPage) || 1;
   const paginatedData = useMemo(() => {
@@ -716,7 +809,7 @@ export default function App() {
     if (filteredData.length === 0) return;
     setExporting(true);
     try {
-      const blob = await buildXlsxBlobWithJSZip(filteredData, OUTPUT_COLUMNS);
+      const blob = await buildXlsxBlobWithJSZip(filteredData, outputColumns);
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
@@ -730,9 +823,9 @@ export default function App() {
 
   const downloadCSV = () => {
     if (filteredData.length === 0) return;
-    const headerLine = OUTPUT_COLUMNS.join(',');
+    const headerLine = outputColumns.join(',');
     const lines = filteredData.map((row) =>
-      OUTPUT_COLUMNS.map((col) => `"${formatCellValue(row[col]).replace(/"/g, '""')}"`).join(',')
+      outputColumns.map((col) => `"${formatCellValue(row[col]).replace(/"/g, '""')}"`).join(',')
     );
     const csvContent = [headerLine, ...lines].join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -750,7 +843,7 @@ export default function App() {
     // hora que produciría JSON.stringify por defecto sobre un objeto Date.
     const serializable = filteredData.map((row) => {
       const obj = {};
-      OUTPUT_COLUMNS.forEach((col) => {
+      outputColumns.forEach((col) => {
         obj[col] = row[col] instanceof Date ? formatCellValue(row[col]) : row[col];
       });
       return obj;
@@ -767,6 +860,23 @@ export default function App() {
   };
 
   const totalWarnings = files.filter((f) => f.warning).length;
+  const hasCalculatedRows = mode === 'siigo' && consolidatedRows.some((r) => r._fill === 'yellow');
+
+  // En el modo Siigo los ceros se muestran como "-" y los montos se colorean
+  // (verde = viene de Siigo, amarillo = calculado), igual que en el ejemplo.
+  const renderCell = (row, col) => {
+    const value = row[col];
+    if (mode === 'siigo' && VALUE_COLUMNS.has(col) && value === 0) return '-';
+    return formatCellValue(value);
+  };
+  const cellClass = (row, col) => {
+    const base = 'px-4 py-2.5 whitespace-nowrap';
+    if (mode === 'siigo' && row._fill && VALUE_COLUMNS.has(col) && row[col] !== 0) {
+      return `${base} text-right ${FILL_CLASS[row._fill]}`;
+    }
+    if (VALUE_COLUMNS.has(col)) return `${base} text-right`;
+    return base;
+  };
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 font-sans">
@@ -788,10 +898,31 @@ export default function App() {
             Transformador de Nómina: Ancho → Largo
           </h1>
           <p className="text-sm text-slate-600 max-w-2xl mx-auto leading-relaxed">
-            Carga uno o varios archivos de nómina (.xlsx / .xlsm) tal como los envía cada empresa.
-            La herramienta detecta automáticamente los bloques por mes, filtra los conceptos sin
-            valor y consolida todo en un único formato largo listo para el cruce contra Siigo.
+            Carga uno o varios archivos (.xlsx / .xlsm) y consolida todo en un único formato largo
+            listo para el cruce contra Siigo. Elige abajo qué tipo de archivo vas a cargar.
           </p>
+        </div>
+
+        {/* Selector de modo */}
+        <div className="flex justify-center">
+          <div className="inline-flex rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
+            <button
+              onClick={() => changeMode('nomina')}
+              className={`px-4 py-2 text-xs font-semibold rounded-lg transition-colors cursor-pointer ${
+                mode === 'nomina' ? 'bg-blue-900 text-white' : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              Nómina por bloques de mes
+            </button>
+            <button
+              onClick={() => changeMode('siigo')}
+              className={`px-4 py-2 text-xs font-semibold rounded-lg transition-colors cursor-pointer ${
+                mode === 'siigo' ? 'bg-blue-900 text-white' : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              Movimiento CC (Siigo)
+            </button>
+          </div>
         </div>
 
         {/* Instrucciones */}
@@ -810,7 +941,7 @@ export default function App() {
               <ChevronDown className="w-5 h-5 text-blue-800" />
             )}
           </button>
-          {showInstructions && (
+          {showInstructions && mode === 'nomina' && (
             <div className="px-6 pb-6 pt-2 border-t border-blue-100 text-xs text-slate-700 space-y-2.5 leading-relaxed">
               <p>
                 <strong className="text-slate-900">1. Cargar archivos:</strong> puedes seleccionar
@@ -826,12 +957,13 @@ export default function App() {
               <p>
                 <strong className="text-slate-900">3. Filtros de calidad:</strong> se excluyen
                 automáticamente los subtotales (Payments, Total, Fee, etc.), los conceptos en cero
-                o vacíos, y las filas sin empleado identificado.
+                o vacíos, las columnas que no son montos (fechas, país, estado) y las filas sin
+                empleado identificado.
               </p>
               <p>
-                <strong className="text-slate-900">4. Mes elaboración:</strong> el mes se convierte
-                a fecha real (primer día del mes), tolerando mayúsculas/minúsculas mezcladas y
-                errores de digitación en el nombre del mes.
+                <strong className="text-slate-900">4. Mes elaboración y empleado:</strong> el mes se
+                convierte a fecha real (primer día del mes), tolerando errores de digitación. El
+                nombre del empleado se unifica por código, así todos los meses salen igual.
               </p>
               <p>
                 <strong className="text-slate-900">5. Consolidado:</strong> todos los archivos
@@ -842,6 +974,39 @@ export default function App() {
               <p>
                 <strong className="text-slate-900">6. Exportar:</strong> descarga el resultado en
                 Excel, CSV o JSON.
+              </p>
+            </div>
+          )}
+          {showInstructions && mode === 'siigo' && (
+            <div className="px-6 pb-6 pt-2 border-t border-blue-100 text-xs text-slate-700 space-y-2.5 leading-relaxed">
+              <p>
+                <strong className="text-slate-900">1. Cargar el Movimiento CC:</strong> el archivo
+                de Siigo con las columnas Comprobante, Fecha elaboración, Descripción, Tercero,
+                Débito y Crédito. Se usa la primera hoja que tenga ese encabezado.
+              </p>
+              <p>
+                <strong className="text-slate-900">2. Qué se toma de Siigo (verde):</strong> salario,
+                subsidio de transporte, auxilio extralegal, vacaciones, licencia remunerada y los
+                aportes de pensión, salud, cajas y ARL. Solo comprobantes CC-*; las facturas (FV) y
+                notas crédito (NC) se ignoran.
+              </p>
+              <p>
+                <strong className="text-slate-900">3. Qué se calcula (amarillo):</strong> 13TH
+                SALARY, 14TH SALARY e INTEREST ON 14TH SALARY no existen en Siigo. Se calculan con
+                la base de salario + transporte + vacaciones + licencia. Revísalos: si tu criterio
+                contable es otro, el resultado puede diferir en algunos pesos.
+              </p>
+              <p>
+                <strong className="text-slate-900">4. Qué se omite:</strong> prima de servicios,
+                intereses de cesantías y consignación de cesantías (ya las cubren las provisiones).
+                Lo que no se reconoce aparece como aviso bajo el archivo, nunca se pierde en
+                silencio.
+              </p>
+              <p>
+                <strong className="text-slate-900">5. Nombres de concepto:</strong> el auxilio
+                extralegal sale como "Alloawance 4 (Other allowances)". Si un mes debe llevar otro
+                nombre, se cambia en <code>ALLOWANCE_NAME_BY_MONTH</code> dentro de
+                siigoConverter.js.
               </p>
             </div>
           )}
@@ -862,7 +1027,9 @@ export default function App() {
             </div>
             <div>
               <p className="font-semibold text-base text-slate-800">
-                Arrastra tus archivos de nómina (.xlsx / .xlsm) o haz clic para buscar
+                {mode === 'siigo'
+                  ? 'Arrastra el Movimiento CC de Siigo (.xlsx / .xlsm) o haz clic para buscar'
+                  : 'Arrastra tus archivos de nómina (.xlsx / .xlsm) o haz clic para buscar'}
               </p>
               <p className="text-xs text-slate-500 mt-1">
                 Puedes seleccionar varios archivos a la vez — se van sumando al consolidado
@@ -895,32 +1062,46 @@ export default function App() {
             {files.map((f) => (
               <div
                 key={f.fileId}
-                className={`flex items-center justify-between gap-3 px-3 py-2 rounded-lg border text-xs ${
+                className={`px-3 py-2 rounded-lg border text-xs space-y-1.5 ${
                   f.warning ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-200'
                 }`}
               >
-                <div className="flex items-center gap-2 min-w-0">
-                  {f.warning ? (
-                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                  ) : (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                  )}
-                  <div className="min-w-0">
-                    <p className="font-semibold text-slate-800 truncate">{f.fileName}</p>
-                    <p className="text-slate-500">
-                      {f.warning
-                        ? f.warning
-                        : `${f.rows.length} filas generadas · Empresa: ${f.empresa}`}
-                    </p>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    {f.warning ? (
+                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                    ) : (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                    )}
+                    <div className="min-w-0">
+                      <p className="font-semibold text-slate-800 truncate">{f.fileName}</p>
+                      <p className="text-slate-500">
+                        {f.warning
+                          ? f.warning
+                          : `${f.rows.length} filas generadas · Empresa: ${f.empresa}`}
+                      </p>
+                    </div>
                   </div>
+                  <button
+                    onClick={() => removeFile(f.fileId)}
+                    className="p-1 rounded hover:bg-white text-slate-400 hover:text-red-600 transition-colors cursor-pointer shrink-0"
+                    title="Quitar este archivo"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
                 </div>
-                <button
-                  onClick={() => removeFile(f.fileId)}
-                  className="p-1 rounded hover:bg-white text-slate-400 hover:text-red-600 transition-colors cursor-pointer shrink-0"
-                  title="Quitar este archivo"
-                >
-                  <X className="w-4 h-4" />
-                </button>
+                {f.notes && f.notes.length > 0 && (
+                  <ul className="pl-6 space-y-1">
+                    {f.notes.map((note, idx) => (
+                      <li
+                        key={idx}
+                        className={note.type === 'warn' ? 'text-amber-800' : 'text-slate-600'}
+                      >
+                        {note.text}
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </div>
             ))}
             {totalWarnings > 0 && (
@@ -981,11 +1162,24 @@ export default function App() {
               </div>
             </div>
 
+            {hasCalculatedRows && (
+              <div className="px-4 py-2 bg-white border-b border-slate-200 flex flex-wrap items-center gap-4 text-xs text-slate-600">
+                <span className="flex items-center gap-1.5">
+                  <span className="inline-block w-3 h-3 rounded-sm bg-green-300" />
+                  Viene de Siigo
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="inline-block w-3 h-3 rounded-sm bg-yellow-300" />
+                  Calculado (no existe en Siigo)
+                </span>
+              </div>
+            )}
+
             <div className="overflow-x-auto max-h-96">
               <table className="w-full text-left text-xs text-slate-700">
                 <thead className="bg-slate-100 uppercase text-slate-500 sticky top-0 border-b border-slate-200 font-semibold">
                   <tr>
-                    {OUTPUT_COLUMNS.map((col) => (
+                    {outputColumns.map((col) => (
                       <th key={col} className="px-4 py-3 whitespace-nowrap">
                         {col}
                       </th>
@@ -995,9 +1189,9 @@ export default function App() {
                 <tbody className="divide-y divide-slate-100">
                   {paginatedData.map((row, idx) => (
                     <tr key={idx} className="hover:bg-slate-50 transition-colors">
-                      {OUTPUT_COLUMNS.map((col) => (
-                        <td key={col} className="px-4 py-2.5 whitespace-nowrap">
-                          {formatCellValue(row[col])}
+                      {outputColumns.map((col) => (
+                        <td key={col} className={cellClass(row, col)}>
+                          {renderCell(row, col)}
                         </td>
                       ))}
                     </tr>
@@ -1035,8 +1229,9 @@ export default function App() {
             <FileX2 className="w-8 h-8 text-slate-300 mx-auto" />
             <p className="text-sm font-semibold text-slate-700">Ningún archivo generó registros</p>
             <p className="text-xs text-slate-500">
-              Revisa los mensajes de advertencia arriba: probablemente el archivo no trae la
-              etiqueta "EMPLOYEE CODE" que la herramienta usa para detectar el formato.
+              {mode === 'siigo'
+                ? 'Revisa los avisos de arriba: probablemente el archivo no es un Movimiento CC de Siigo.'
+                : 'Revisa los mensajes de advertencia arriba: probablemente el archivo no trae la etiqueta "EMPLOYEE CODE" que la herramienta usa para detectar el formato.'}
             </p>
           </div>
         )}
