@@ -16,7 +16,13 @@ import {
   X,
   FileX2
 } from 'lucide-react';
-import { convertNominaRows, convertMovimientoRows, STATUS_COLORS } from './nominaConverter';
+import {
+  convertNominaRows,
+  convertNominaFiles,
+  convertMovimientoRows,
+  convertMovimientoFiles,
+  STATUS_COLORS
+} from './nominaConverter';
 
 // ============================================================================
 // LECTOR DE .xlsx / .xlsm CON JSZIP (sin librería xlsx/SheetJS)
@@ -306,6 +312,22 @@ function newFileId(file) {
   return `${file.name}-${file.size}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// Primer renglón con varios textos de cada hoja: sirve para decirle al usuario
+// qué encabezados vio la app cuando no reconoce el formato de un archivo.
+function headerHint(sheets) {
+  for (const { name, rows } of sheets) {
+    for (let r = 0; r < Math.min(rows.length, 60); r++) {
+      const cells = (rows[r] || [])
+        .map((c) => (c && typeof c.v === 'string' ? c.v.trim() : ''))
+        .filter(Boolean);
+      if (cells.length >= 4) {
+        return `hoja "${name}", fila ${r + 1}: ${cells.slice(0, 8).join(' | ')}`;
+      }
+    }
+  }
+  return null;
+}
+
 // ============================================================================
 // PROCESAMIENTO: Nómina (formato ancho) o Movimiento CC -> formato largo
 // ============================================================================
@@ -327,17 +349,28 @@ async function readNominaFile(file) {
 
 function convertLoadedFile(loaded, unifyNames) {
   if (loaded.readError) {
-    return { ...loaded, rows: [], notes: [], warning: loaded.readError, sourceType: null };
+    return {
+      ...loaded,
+      rows: [],
+      notes: [],
+      warning: loaded.readError,
+      sourceType: null,
+      nominaRows: null,
+      movimientoRows: null
+    };
   }
 
   let converted = null;
   let sourceType = null;
+  let nominaRows = null; // filas de la hoja de nómina usada (para consolidar varios archivos)
+  let movimientoRows = null; // filas de la hoja de Movimiento CC usada (para consolidar varios archivos)
 
   for (const { rows } of loaded.sheets) {
     const result = convertNominaRows(rows, { unifyNamesByCode: unifyNames });
     if (result) {
       converted = result;
       sourceType = 'nomina';
+      nominaRows = rows;
       break; // la primera hoja con bloques de nómina (las demás son auxiliares o el formato largo)
     }
   }
@@ -348,6 +381,7 @@ function convertLoadedFile(loaded, unifyNames) {
       if (result) {
         converted = result;
         sourceType = 'movimiento';
+        movimientoRows = rows;
         break; // la primera hoja que sea un Movimiento CC (Comprobante/Fecha/Descripción/Débito/Crédito)
       }
     }
@@ -357,6 +391,10 @@ function convertLoadedFile(loaded, unifyNames) {
   if (!converted) {
     warning =
       'No se reconoció el formato del archivo: ni bloques de nómina (encabezado con EMPLOYEE CODE y NAME) ni un Movimiento CC de Siigo (encabezado con Comprobante, Fecha elaboración, Descripción, Débito y Crédito).';
+    const hint = headerHint(loaded.sheets);
+    if (hint) {
+      warning += ` Primer encabezado que vi: ${hint}. Si es una nómina, agrega esos nombres a los alias de nominaConverter.js.`;
+    }
   } else if (converted.records.length === 0) {
     warning = 'Se reconoció el formato, pero no se generó ningún registro con valor.';
   }
@@ -366,7 +404,9 @@ function convertLoadedFile(loaded, unifyNames) {
     rows: converted ? converted.records : [],
     notes: converted ? converted.notes : [],
     warning,
-    sourceType
+    sourceType,
+    nominaRows,
+    movimientoRows
   };
 }
 
@@ -552,6 +592,7 @@ export default function App() {
   const [showInstructions, setShowInstructions] = useState(true);
   const [files, setFiles] = useState([]); // { fileId, fileName, empresa, sheets } | { ..., readError }
   const [unifyNames, setUnifyNames] = useState(true);
+  const [consolidateNomina, setConsolidateNomina] = useState(false);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
@@ -569,7 +610,44 @@ export default function App() {
     [files, unifyNames]
   );
 
-  const consolidatedRows = useMemo(() => processed.flatMap((f) => f.rows), [processed]);
+  // Consolidación de varios archivos de una misma empresa bajo la misma casilla:
+  // varias nóminas anchas (p. ej. los 4 a 6 archivos mensuales de RemoFirst) y/o
+  // varios Movimiento CC (p. ej. un archivo por rango de fechas). Es opcional
+  // porque los códigos de empleado / nombres de empresas distintas podrían
+  // repetirse y mezclar datos. Para el Movimiento CC, además, consolidar antes
+  // de convertir es lo que permite que la inferencia de empleado por fecha (en
+  // aportes patronales y en filas de salario sin Tercero) vea todas las filas de
+  // una misma fecha aunque hayan llegado en archivos distintos.
+  const nominaConsolidation = useMemo(() => {
+    if (!consolidateNomina) return null;
+    const inputs = processed
+      .filter((f) => f.sourceType === 'nomina' && f.nominaRows)
+      .map((f) => ({ rows: f.nominaRows, name: f.fileName }));
+    if (inputs.length < 2) return null;
+    return convertNominaFiles(inputs, { unifyNamesByCode: unifyNames });
+  }, [processed, consolidateNomina, unifyNames]);
+
+  const movimientoConsolidation = useMemo(() => {
+    if (!consolidateNomina) return null;
+    const inputs = processed
+      .filter((f) => f.sourceType === 'movimiento' && f.movimientoRows)
+      .map((f) => ({ rows: f.movimientoRows, name: f.fileName }));
+    if (inputs.length < 2) return null;
+    return convertMovimientoFiles(inputs);
+  }, [processed, consolidateNomina]);
+
+  const consolidatedRows = useMemo(() => {
+    const nominaRows = nominaConsolidation
+      ? nominaConsolidation.records
+      : processed.filter((f) => f.sourceType === 'nomina').flatMap((f) => f.rows);
+    const movimientoRows = movimientoConsolidation
+      ? movimientoConsolidation.records
+      : processed.filter((f) => f.sourceType === 'movimiento').flatMap((f) => f.rows);
+    const otherRows = processed
+      .filter((f) => f.sourceType !== 'nomina' && f.sourceType !== 'movimiento')
+      .flatMap((f) => f.rows);
+    return [...nominaRows, ...movimientoRows, ...otherRows];
+  }, [processed, nominaConsolidation, movimientoConsolidation]);
 
   // Colores presentes en el resultado, para la leyenda.
   const legendColors = useMemo(() => {
@@ -772,7 +850,10 @@ export default function App() {
                 y NAME) o el Movimiento CC de Siigo (encabezado con Comprobante, Fecha elaboración,
                 Descripción, Débito y Crédito). La app prueba primero como nómina y, si no
                 encuentra bloques, como Movimiento CC. Puedes seleccionar varios archivos a la vez,
-                incluso mezclando los dos tipos.
+                incluso mezclando los dos tipos. Si son varios archivos de una misma empresa —
+                varias nóminas (p. ej. los de RemoFirst) o varios Movimiento CC (p. ej. uno por
+                rango de fechas) — marca la casilla de consolidar para que se junten antes de
+                convertir.
               </p>
               <p>
                 <strong className="text-slate-900">2. Qué sale de la nómina:</strong> una fila por
@@ -781,11 +862,13 @@ export default function App() {
                 conceptos en cero no se listan.
               </p>
               <p>
-                <strong className="text-slate-900">3. Qué sale del Movimiento CC:</strong> una fila
-                por movimiento, con "Concepto" igual al texto de Descripción, "Empleado" tomado de
-                Tercero (casi siempre viene vacío en este tipo de archivo — no se inventa el
-                nombre) y "Valor Concepto" como Débito menos Crédito. Al final de cada comprobante
-                se agrega su fila de total, igual que TOTAL EMPLOYEE COST en la nómina.
+                <strong className="text-slate-900">3. Qué sale del Movimiento CC:</strong> cada
+                Descripción se clasifica a un concepto tipo nómina (SALARY, PENSION COST, HEALTH
+                COST…) con la tabla CONCEPT_KEYWORDS, se suma por mes, concepto y empleado (Débito −
+                Crédito) y se agrega TOTAL EMPLOYEE COST por mes y empleado. Los aportes patronales,
+                y las filas de salario/prestación que vengan sin Tercero, se asignan al empleado del
+                mismo día (si hay un único candidato); si no se puede, salen como "(sin asignar)".
+                Lo que no se reconoce queda con el texto de Descripción y se avisa.
               </p>
               <p>
                 <strong className="text-slate-900">4. Colores:</strong> son los que ya trae el
@@ -849,7 +932,7 @@ export default function App() {
               <h2 className="text-sm font-bold text-slate-800">
                 Archivos cargados ({files.length})
               </h2>
-              <div className="flex items-center gap-4">
+              <div className="flex items-center gap-4 flex-wrap justify-end">
                 <label className="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
                   <input
                     type="checkbox"
@@ -857,6 +940,14 @@ export default function App() {
                     onChange={(e) => setUnifyNames(e.target.checked)}
                   />
                   Unificar el nombre de cada empleado por código (solo nómina)
+                </label>
+                <label className="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={consolidateNomina}
+                    onChange={(e) => setConsolidateNomina(e.target.checked)}
+                  />
+                  Varios archivos de una misma empresa (nómina y/o Movimiento CC): consolidar
                 </label>
                 <button
                   onClick={clearAll}
@@ -916,6 +1007,36 @@ export default function App() {
                 )}
               </div>
             ))}
+            {nominaConsolidation && (
+              <div className="px-3 py-2 rounded-lg border border-blue-200 bg-blue-50/60 text-xs space-y-1">
+                <p className="font-semibold text-blue-900">Consolidación de nóminas</p>
+                <ul className="pl-4 space-y-1">
+                  {nominaConsolidation.notes.map((n, i) => (
+                    <li
+                      key={i}
+                      className={n.type === 'warn' ? 'text-amber-800' : 'text-slate-600'}
+                    >
+                      {n.text}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {movimientoConsolidation && (
+              <div className="px-3 py-2 rounded-lg border border-blue-200 bg-blue-50/60 text-xs space-y-1">
+                <p className="font-semibold text-blue-900">Consolidación de Movimiento CC</p>
+                <ul className="pl-4 space-y-1">
+                  {movimientoConsolidation.notes.map((n, i) => (
+                    <li
+                      key={i}
+                      className={n.type === 'warn' ? 'text-amber-800' : 'text-slate-600'}
+                    >
+                      {n.text}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {totalWarnings > 0 && (
               <p className="text-xs text-amber-700 pt-1">
                 {totalWarnings} archivo(s) no generaron filas — revisa que sean la nómina o el

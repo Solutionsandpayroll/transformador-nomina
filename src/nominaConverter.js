@@ -12,9 +12,13 @@
 //
 // Cómo se lee la nómina (todas las empresas la arman distinto, así que NO hay
 // columnas fijas):
-//   - Cada bloque mensual empieza con una fila de encabezado que trae
-//     "EMPLOYEE CODE" y "NAME". Los conceptos son los encabezados de las columnas
-//     que están a la derecha de NAME, en el mismo orden en que aparecen.
+//   - Cada bloque mensual empieza con una fila de encabezado que trae un
+//     encabezado de "código de empleado" y uno de "nombre" (ver
+//     CODE_HEADER_ALIASES / NAME_HEADER_ALIASES más abajo — RemoFirst usa
+//     "EMPLOYEE CODE" / "NAME", pero cada empresa nueva puede traer otra
+//     redacción; agrega el alias ahí en vez de tocar la lógica). Los
+//     conceptos son los encabezados de las columnas que están a la derecha
+//     de la columna de nombre, en el mismo orden en que aparecen.
 //   - El mes sale del rótulo de la columna A ("Junio 2026", "MAYO"...). Si el
 //     rótulo no trae año se deduce por la secuencia de bloques.
 //   - Se ignoran los subtotales (PAYMENTS, TOTAL...), las columnas en USD, FEE y
@@ -59,6 +63,39 @@ const NOT_AN_EMPLOYEE = /^(TOTAL|NOMINA|CONTABILIDAD|NOVEDAD|NOVADADES|DIFERENCI
 // Rótulos del resumen del cruce que hay al final de la hoja (columna A).
 const SUMMARY_LABEL = /^(CRUCE|NO ESTA EN EL OTRO|DIFERENCIAS|CRUZA ENTRE|DEBITO - CREDITO)/;
 
+// Marca interna que convertNominaFiles inserta entre un archivo y el siguiente
+// para que el primer bloque de un archivo no herede el mes ni el encabezado
+// del archivo anterior.
+const FILE_BREAK = '__FILE_BREAK__';
+
+// Encabezados que identifican la columna de "código de empleado" y la de
+// "nombre" en la fila de encabezado de cada bloque mensual. RemoFirst usa el
+// texto en inglés ("EMPLOYEE CODE" / "NAME"); a medida que llegan archivos de
+// otras empresas, agrega aquí la variante exacta que traigan (en mayúsculas y
+// sin tildes, que es como los deja `norm()`) — no hace falta tocar el resto
+// del código. Si al convertir un archivo nuevo el resultado sale vacío, lo
+// primero que hay que revisar es si su encabezado real está en estas listas.
+const DEFAULT_CODE_HEADER_ALIASES = [
+  'EMPLOYEE CODE',
+  'CODIGO',
+  'CODIGO EMPLEADO',
+  'COD EMPLEADO',
+  'ID EMPLEADO',
+  'CEDULA',
+  'DOCUMENTO',
+  'NO. IDENTIFICACION',
+  'IDENTIFICACION'
+];
+const DEFAULT_NAME_HEADER_ALIASES = [
+  'NAME',
+  'NOMBRE',
+  'NOMBRE EMPLEADO',
+  'EMPLEADO',
+  'NOMBRE COMPLETO',
+  'NOMBRE DEL EMPLEADO',
+  'NOMBRES Y APELLIDOS'
+];
+
 const MONTHS = [
   ['ENERO', 1],
   ['FEBRERO', 2],
@@ -74,6 +111,11 @@ const MONTHS = [
   ['NOVIEMBRE', 11],
   ['DICIEMBRE', 12]
 ];
+
+// Cuando un empleado no se pudo determinar (p. ej. un aporte patronal sin
+// ningún salario en la misma fecha), se muestra con esta etiqueta en vez de
+// dejar la celda vacía, para que no se pierda de vista en la Hoja2.
+const SIN_EMPLEADO = '(sin asignar)';
 
 // --- Utilidades ---------------------------------------------------------------
 
@@ -128,14 +170,15 @@ function parseMonthLabel(text) {
   return null;
 }
 
-// ¿Esta fila es el encabezado de un bloque? Debe traer EMPLOYEE CODE y NAME.
-function readHeader(row) {
+// ¿Esta fila es el encabezado de un bloque? Debe traer una columna de código
+// de empleado y una de nombre (ver codeAliases / nameAliases).
+function readHeader(row, codeAliases, nameAliases) {
   let codeCol = -1;
   let nameCol = -1;
   for (let c = 0; c < row.length; c++) {
     const t = norm(cellValue(row[c]));
-    if (t === 'EMPLOYEE CODE' && codeCol < 0) codeCol = c;
-    else if (t === 'NAME' && nameCol < 0) nameCol = c;
+    if (codeCol < 0 && codeAliases.includes(t)) codeCol = c;
+    else if (nameCol < 0 && nameAliases.includes(t)) nameCol = c;
   }
   if (codeCol < 0 || nameCol < 0) return null;
 
@@ -186,6 +229,16 @@ export function convertNominaRows(rows, options = {}) {
   const unifyNames = options.unifyNamesByCode !== false;
   const defaultYear = options.defaultYear || new Date().getFullYear();
 
+  // Alias de encabezado: los de por defecto + los que se agreguen por empresa
+  // (options.extraCodeHeaderAliases / extraNameHeaderAliases), o una lista
+  // completa propia si se pasa options.codeHeaderAliases / nameHeaderAliases.
+  const codeAliases = (
+    options.codeHeaderAliases || [...DEFAULT_CODE_HEADER_ALIASES, ...(options.extraCodeHeaderAliases || [])]
+  ).map(norm);
+  const nameAliases = (
+    options.nameHeaderAliases || [...DEFAULT_NAME_HEADER_ALIASES, ...(options.extraNameHeaderAliases || [])]
+  ).map(norm);
+
   const labelEvents = []; // rótulos de mes encontrados, en orden
   const entries = []; // empleado-bloque
   const blockInfo = new Map(); // blockId -> { employees: n, checkFill }
@@ -195,6 +248,14 @@ export function convertNominaRows(rows, options = {}) {
 
   for (let r = 0; r < rows.length; r++) {
     const row = rows[r] || [];
+
+    // Separador entre archivos (lo pone convertNominaFiles): se reinicia el
+    // encabezado y el rótulo de mes para que nada pase de un archivo al siguiente.
+    if (norm(cellValue(row[0])) === FILE_BREAK) {
+      header = null;
+      curLabel = -1;
+      continue;
+    }
 
     // El resumen del cruce (Cruce ok, Diferencias...) va al final de la hoja: ahí terminan los bloques.
     if (SUMMARY_LABEL.test(norm(cellValue(row[0])))) {
@@ -208,7 +269,7 @@ export function convertNominaRows(rows, options = {}) {
       curLabel = labelEvents.length - 1;
     }
 
-    const h = readHeader(row);
+    const h = readHeader(row, codeAliases, nameAliases);
     if (h) {
       header = h;
       blockId += 1;
@@ -449,6 +510,50 @@ export function convertNominaRows(rows, options = {}) {
   return { records, notes };
 }
 
+// --- Consolidar varias nóminas (varios archivos del mismo mes o de varios
+// meses) en un solo resultado ---------------------------------------------------
+// RemoFirst, por ejemplo, no entrega un único archivo general por mes sino
+// 4, 5 o 6 archivos distintos según el mes. Esta función junta las filas de
+// todos los archivos de una misma empresa (en el orden en que los subas) y
+// llama a convertNominaRows una sola vez sobre el conjunto completo, para que
+// el resultado quede consolidado en un solo archivo en vez de uno por archivo
+// de entrada.
+//
+// Entre un archivo y el siguiente se inserta un separador (FILE_BREAK) para
+// que el primer bloque de un archivo no herede el mes del anterior, y al final
+// el resultado se ordena cronológicamente por mes (a igual mes se conserva el
+// orden en que aparecieron los bloques/archivos).
+//
+// Uso desde App.jsx: se juntan las hojas de nómina de una misma empresa en
+// `files` y se llama a esta función una sola vez; el resultado (records +
+// notes) es el que se exporta a Excel.
+export function convertNominaFiles(files, options = {}) {
+  // files: [{ rows, name? }, ...] — `rows` es el mismo array de arrays que
+  // recibe convertNominaRows; `name` es opcional, solo para los avisos.
+  const usable = (files || []).filter((f) => f && Array.isArray(f.rows) && f.rows.length > 0);
+  if (usable.length === 0) return null;
+
+  const allRows = [];
+  for (const f of usable) {
+    allRows.push([{ v: FILE_BREAK, f: null }]);
+    allRows.push(...f.rows);
+  }
+
+  const result = convertNominaRows(allRows, options);
+  if (!result) return null;
+
+  // Orden cronológico (Array.sort es estable: dentro de un mismo mes se
+  // conserva el orden original de los bloques y de los empleados).
+  result.records = [...result.records].sort((a, b) => a['Mes elaboración'] - b['Mes elaboración']);
+
+  const names = usable.map((f, i) => f.name || `archivo ${i + 1}`).join(', ');
+  result.notes.unshift({
+    type: 'info',
+    text: `Se consolidaron ${usable.length} archivo(s) de entrada en un solo resultado (${names}).`
+  });
+  return result;
+}
+
 // ============================================================================
 // CONVERTIDOR: Movimiento CC (extracto contable de Siigo) -> resumen tipo nómina
 // ============================================================================
@@ -457,30 +562,29 @@ export function convertNominaRows(rows, options = {}) {
 // Crédito | Saldo Movimiento (el orden de columnas puede variar entre
 // empresas; se detectan por el nombre del encabezado, no por posición fija).
 //
-// A diferencia de la versión anterior (una fila cruda por movimiento), esta
-// versión reproduce el mismo resumen "tipo nómina" que se arma a mano en
+// Esta versión reproduce el mismo resumen "tipo nómina" que se arma a mano en
 // Excel con Tabla dinámica / SUMIFS:
 //
 //   1. Cada Descripción se clasifica a un concepto tipo nómina (SALARY,
 //      Transport allowance, PENSION COST, HEALTH COST...) usando la tabla
 //      CONCEPT_KEYWORDS de abajo — el equivalente en código a la hoja
 //      "Mapeo" del Excel. Es la primera palabra clave que aparece como
-//      substring de la Descripción (sin tildes ni mayúsculas/minúsculas).
+//      substring de la Descripción (sin tildes ni mayúsculas/minúsculas), o
+//      como palabra completa si la entrada trae `wholeWord: true`.
 //      Si no coincide con ninguna, el concepto queda tal cual venía en
-//      Descripción (igual que antes) y se marca como "sin clasificar" en
-//      los avisos, para que edites CONCEPT_KEYWORDS y no quede escondido.
+//      Descripción y se marca como "sin clasificar" en los avisos, para que
+//      edites CONCEPT_KEYWORDS y no quede escondido.
 //
 //   2. Empleado: en las filas de salario/prestaciones (grupo 'empleado')
-//      Tercero YA es el nombre del empleado, igual que antes. Pero en los
-//      aportes patronales (pensión, EPS, caja de compensación, ARL —
-//      grupo 'aporte') Tercero es la entidad (Porvenir, Sanitas...), NO el
-//      empleado. Para esas filas el empleado se infiere: se busca, en la
-//      MISMA fecha de elaboración, qué empleado aparece en alguna fila del
-//      grupo 'empleado' (normalmente el comprobante de nómina de ese mismo
-//      cierre). Si en esa fecha hay un solo empleado candidato, se le
-//      asigna. Si hay varios (empresa con más de un empleado pagado el
-//      mismo día) o ninguno, la fila queda con Empleado vacío y se avisa,
-//      en vez de adivinar.
+//      Tercero YA es el nombre del empleado. Pero en los aportes patronales
+//      (pensión, EPS, caja de compensación, ARL — grupo 'aporte') Tercero es
+//      la entidad (Porvenir, Sanitas...), NO el empleado. Para esas filas el
+//      empleado se infiere: primero se busca, en la MISMA fecha de
+//      elaboración, qué empleado aparece en alguna fila del grupo
+//      'empleado'. Si en esa fecha no hay ninguno, se busca en el MISMO MES.
+//      Si el conjunto candidato tiene un solo empleado, se le asigna. Si hay
+//      varios (empresa con más de un empleado pagado el mismo día/mes) o
+//      ninguno, la fila queda marcada como "(sin asignar)" en vez de adivinar.
 //
 //   3. Las filas de ingreso/facturación al cliente (grupo 'excluir': "EO
 //      Third parties service...", "Ingresos recibidos...") no son costo de
@@ -492,9 +596,13 @@ export function convertNominaRows(rows, options = {}) {
 //      pudo atribuir a ese empleado ese mes — el mismo patrón que usa
 //      convertNominaRows.
 //
-// Esta función sigue devolviendo las mismas columnas de siempre (Mes
-// elaboración | Concepto | Empleado | Valor Concepto | Valor Totales), así
-// que App.jsx no necesita ningún cambio.
+//   5. Las filas de salida quedan ordenadas por Mes, luego Empleado y,
+//      dentro de cada mes-empleado, en el orden en que los conceptos
+//      aparecieron en el extracto contable, con TOTAL EMPLOYEE COST al
+//      final del bloque — igual que en la Hoja2 de referencia.
+//
+// Devuelve las mismas columnas de siempre (Mes elaboración | Concepto |
+// Empleado | Valor Concepto | Valor Totales).
 
 // Tabla de clasificación — el equivalente en código a la hoja "Mapeo" del
 // Excel. Se evalúa en orden, con la primera palabra clave (normalizada, sin
@@ -503,8 +611,9 @@ export function convertNominaRows(rows, options = {}) {
 // del resultado te dicen cuáles quedaron "sin clasificar").
 //
 //   group: 'empleado' -> Tercero ya es el nombre del empleado.
-//   group: 'aporte'   -> Tercero es la entidad; el empleado se infiere por fecha.
+//   group: 'aporte'   -> Tercero es la entidad; el empleado se infiere por fecha/mes.
 //   group: 'excluir'  -> no es costo de nómina, se descarta (ingresos/facturación).
+//   wholeWord: true   -> la palabra clave debe aparecer como palabra completa.
 export const CONCEPT_KEYWORDS = [
   { keyword: 'EO THIRD PARTIES', concepto: null, group: 'excluir' },
   { keyword: 'INGRESOS RECIBIDOS', concepto: null, group: 'excluir' },
@@ -518,7 +627,7 @@ export const CONCEPT_KEYWORDS = [
   { keyword: 'PRIMA DE SERVICIOS', concepto: '13TH SALARY', group: 'empleado' },
   { keyword: 'INTERESES CESANTIAS', concepto: 'INTEREST ON 14TH SALARY', group: 'empleado' },
   { keyword: 'CONSIGNACION CESANTIAS', concepto: '14TH SALARY', group: 'empleado' },
-  { keyword: 'FPP', concepto: 'Other (People Pass / dotación)', group: 'empleado' },
+  { keyword: 'FPP', concepto: 'Other (People Pass / dotación)', group: 'empleado', wholeWord: true },
 
   { keyword: 'APORTES A FONDOS DE', concepto: 'PENSION COST', group: 'aporte' },
   { keyword: 'APORTES A ENTIDADES PROMOTORAS DE SALUD', concepto: 'HEALTH COST', group: 'aporte' },
@@ -589,20 +698,17 @@ function readMovimientoHeader(row) {
   };
 }
 
-// Primera palabra clave de CONCEPT_KEYWORDS que aparece dentro de la
-// Descripción (normalizada). null si ninguna coincide.
-function matchConcept(descripcionNorm) {
-  for (const entry of CONCEPT_KEYWORDS) {
-    if (descripcionNorm.includes(norm(entry.keyword))) return entry;
-  }
-  return null;
-}
-
 export function convertMovimientoRows(rows, options = {}) {
   const conceptKeywords = options.conceptKeywords || CONCEPT_KEYWORDS;
   const matchConceptWith = (descripcionNorm) => {
+    // Descripción con todo lo que no sea letra/número convertido en espacio,
+    // para poder buscar palabras completas (p. ej. "FPP" no debe coincidir
+    // dentro de otra palabra).
+    const words = ` ${descripcionNorm.replace(/[^A-Z0-9]+/g, ' ')} `;
     for (const entry of conceptKeywords) {
-      if (descripcionNorm.includes(norm(entry.keyword))) return entry;
+      const k = norm(entry.keyword);
+      const hit = entry.wholeWord ? words.includes(` ${k} `) : descripcionNorm.includes(k);
+      if (hit) return entry;
     }
     return null;
   };
@@ -613,6 +719,7 @@ export function convertMovimientoRows(rows, options = {}) {
   // --- Pasada 1: leer cada movimiento y clasificarlo -----------------------------
   const parsedRows = [];
   const employeesByDate = new Map(); // dateKey -> Set(nombre de empleado)
+  const employeesByMonth = new Map(); // monthKey -> Set(nombre de empleado)
   const unknownFills = new Map();
   let excludedRows = 0;
   let skippedNoDate = 0;
@@ -676,6 +783,10 @@ export function convertMovimientoRows(rows, options = {}) {
     if (group === 'empleado' && terceroVal) {
       if (!employeesByDate.has(dKey)) employeesByDate.set(dKey, new Set());
       employeesByDate.get(dKey).add(terceroVal);
+
+      const mKey = monthKey(monthDate);
+      if (!employeesByMonth.has(mKey)) employeesByMonth.set(mKey, new Set());
+      employeesByMonth.get(mKey).add(terceroVal);
     }
 
     const rawFill = cellFill(debito !== 0 ? debitoCell : creditoCell) || cellFill(debitoCell) || cellFill(creditoCell);
@@ -691,22 +802,26 @@ export function convertMovimientoRows(rows, options = {}) {
   if (!header || dataRows === 0) return null;
 
   // --- Pasada 2: resolver el empleado de las filas de aporte patronal ------------
+  // Primero por fecha exacta; si ese día no hay ninguna fila de salario, se usa
+  // el conjunto de empleados del mes. Solo se asigna cuando hay un único candidato.
   let ambiguousAporte = 0;
   let unresolvedAporte = 0;
+  let monthFallback = 0;
   for (const pr of parsedRows) {
     if (pr.group !== 'aporte') {
       pr.empleado = pr.tercero;
       continue;
     }
-    const candidates = employeesByDate.get(pr.dKey);
-    if (candidates && candidates.size === 1) {
-      pr.empleado = [...candidates][0];
-    } else if (candidates && candidates.size > 1) {
-      pr.empleado = '';
-      ambiguousAporte += 1;
+    const byDate = employeesByDate.get(pr.dKey);
+    const byMonth = employeesByMonth.get(monthKey(pr.monthDate));
+    const pool = byDate && byDate.size > 0 ? byDate : byMonth;
+    if (pool && pool.size === 1) {
+      pr.empleado = [...pool][0];
+      if (pool === byMonth && !(byDate && byDate.size > 0)) monthFallback += 1;
     } else {
       pr.empleado = '';
-      unresolvedAporte += 1;
+      if (pool && pool.size > 1) ambiguousAporte += 1;
+      else unresolvedAporte += 1;
     }
   }
 
@@ -739,7 +854,7 @@ export function convertMovimientoRows(rows, options = {}) {
     records.push({
       'Mes elaboración': g.monthDate,
       Concepto: g.concepto,
-      Empleado: g.empleado,
+      Empleado: g.empleado || SIN_EMPLEADO,
       'Valor Concepto': g.value,
       'Valor Totales': 0,
       _fill: g.fill
@@ -755,12 +870,41 @@ export function convertMovimientoRows(rows, options = {}) {
     records.push({
       'Mes elaboración': new Date(Date.UTC(y, m - 1, 1)),
       Concepto: 'TOTAL EMPLOYEE COST',
-      Empleado: empleado,
+      Empleado: empleado || SIN_EMPLEADO,
       'Valor Concepto': 0,
       'Valor Totales': total,
       _fill: null
     });
   }
+
+  // --- Orden de salida -------------------------------------------------------------
+  // Mes -> Empleado -> conceptos en el orden en que aparecieron en el extracto,
+  // con TOTAL EMPLOYEE COST al final de cada bloque mes-empleado. Así queda
+  // igual a como se arma la Hoja2 a mano.
+  const firstSeen = new Map(); // "mes|empleado|concepto" -> índice de aparición
+  parsedRows.forEach((pr, idx) => {
+    const key = `${monthKey(pr.monthDate)}|${pr.empleado || SIN_EMPLEADO}|${pr.concepto}`;
+    if (!firstSeen.has(key)) firstSeen.set(key, idx);
+  });
+
+  const sortKey = (rec) => {
+    const d = rec['Mes elaboración'];
+    const monthNum = d.getUTCFullYear() * 12 + d.getUTCMonth();
+    const isTotal = rec.Concepto === 'TOTAL EMPLOYEE COST' ? 1 : 0;
+    const orderKey = `${monthKey(d)}|${rec.Empleado}|${rec.Concepto}`;
+    const order = firstSeen.has(orderKey) ? firstSeen.get(orderKey) : Number.MAX_SAFE_INTEGER;
+    return [monthNum, rec.Empleado, isTotal, order];
+  };
+
+  records.sort((a, b) => {
+    const ka = sortKey(a);
+    const kb = sortKey(b);
+    for (let i = 0; i < ka.length; i++) {
+      if (ka[i] < kb[i]) return -1;
+      if (ka[i] > kb[i]) return 1;
+    }
+    return 0;
+  });
 
   // --- Avisos ---------------------------------------------------------------------
   const notes = [];
@@ -788,16 +932,22 @@ export function convertMovimientoRows(rows, options = {}) {
       }.`
     });
   }
+  if (monthFallback > 0) {
+    notes.push({
+      type: 'info',
+      text: `${monthFallback} movimiento(s) de aporte patronal no tenían un salario en su fecha exacta y se asignaron al único empleado de ese mes.`
+    });
+  }
   if (unresolvedAporte > 0) {
     notes.push({
       type: 'warn',
-      text: `${unresolvedAporte} fila(s) de aporte patronal (pensión/salud/caja/ARL) no se pudieron asignar a ningún empleado porque no hay ninguna fila de salario en esa misma fecha; quedaron con Empleado vacío.`
+      text: `${unresolvedAporte} fila(s) de aporte patronal (pensión/salud/caja/ARL) no se pudieron asignar a ningún empleado porque no hay ninguna fila de salario en esa fecha ni en ese mes; quedaron marcadas como "${SIN_EMPLEADO}".`
     });
   }
   if (ambiguousAporte > 0) {
     notes.push({
       type: 'warn',
-      text: `${ambiguousAporte} fila(s) de aporte patronal quedaron con Empleado vacío porque ese día hay más de un empleado candidato (empresa con varios empleados pagados la misma fecha) — revísalas a mano.`
+      text: `${ambiguousAporte} fila(s) de aporte patronal quedaron marcadas como "${SIN_EMPLEADO}" porque hay más de un empleado candidato (empresa con varios empleados pagados la misma fecha o el mismo mes) — revísalas a mano.`
     });
   }
   if (unclassifiedCount > 0) {
@@ -825,8 +975,72 @@ export function convertMovimientoRows(rows, options = {}) {
   }
   notes.push({
     type: 'info',
-    text: 'Este archivo se leyó como Movimiento CC (extracto contable) y se resumió como nómina: Concepto sale de CONCEPT_KEYWORDS, Empleado se toma de Tercero (o se infiere por fecha en los aportes patronales), y se agregó TOTAL EMPLOYEE COST por mes y empleado.'
+    text: 'Este archivo se leyó como Movimiento CC (extracto contable) y se resumió como nómina: Concepto sale de CONCEPT_KEYWORDS, Empleado se toma de Tercero (o se infiere por fecha/mes en los aportes patronales), y se agregó TOTAL EMPLOYEE COST por mes y empleado. Las filas quedan ordenadas por mes, empleado y el orden de aparición de cada concepto en el extracto.'
   });
 
   return { records, notes };
+}
+
+// --- Consolidar varios Movimiento CC (p. ej. uno por rango de fechas) en un
+// solo resultado --------------------------------------------------------------
+// Igual que convertNominaFiles, pero para Movimiento CC: se pega el contenido
+// de todos los archivos (quitando de cada uno el resumen final del cruce) y se
+// llama a convertMovimientoRows una sola vez sobre el conjunto completo. Esto
+// es lo que permite que la inferencia de empleado por fecha/mes en los aportes
+// patronales vea todas las filas de una misma fecha aunque hayan llegado en
+// archivos distintos.
+//
+// No hace falta un separador tipo FILE_BREAK como en nómina: convertMovimientoRows
+// ya ignora un encabezado repetido (varias hojas pegadas), así que basta con
+// recortar de cada archivo el resumen del cruce antes de concatenarlos, para
+// que ese resumen no corte la lectura antes de llegar al siguiente archivo.
+function trimMovimientoStopSection(rows) {
+  let header = null;
+  let headerFound = false;
+
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r] || [];
+
+    if (!headerFound) {
+      const h = readMovimientoHeader(row);
+      if (h) {
+        header = h;
+        headerFound = true;
+      }
+      continue;
+    }
+    if (readMovimientoHeader(row)) continue;
+
+    const comprobanteVal = clean(cellValue(row[header.comprobanteCol]));
+    const descripcionVal = clean(cellValue(row[header.descripcionCol]));
+    if (!comprobanteVal && MOVIMIENTO_STOP_LABEL.test(norm(descripcionVal))) {
+      return rows.slice(0, r);
+    }
+  }
+  return rows;
+}
+
+export function convertMovimientoFiles(files, options = {}) {
+  // files: [{ rows, name? }, ...] — mismo formato que convertNominaFiles.
+  const usable = (files || []).filter((f) => f && Array.isArray(f.rows) && f.rows.length > 0);
+  if (usable.length === 0) return null;
+
+  const allRows = [];
+  for (const f of usable) {
+    allRows.push(...trimMovimientoStopSection(f.rows));
+  }
+
+  const result = convertMovimientoRows(allRows, options);
+  if (!result) return null;
+
+  // Orden cronológico (Array.sort es estable: dentro de un mismo mes se
+  // conserva el orden ya calculado por convertMovimientoRows).
+  result.records = [...result.records].sort((a, b) => a['Mes elaboración'] - b['Mes elaboración']);
+
+  const names = usable.map((f, i) => f.name || `archivo ${i + 1}`).join(', ');
+  result.notes.unshift({
+    type: 'info',
+    text: `Se consolidaron ${usable.length} archivo(s) de Movimiento CC en un solo resultado (${names}).`
+  });
+  return result;
 }
