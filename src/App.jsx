@@ -21,7 +21,9 @@ import {
   convertNominaFiles,
   convertMovimientoRows,
   convertMovimientoFiles,
-  STATUS_COLORS
+  STATUS_COLORS,
+  cruzarCuenta28,
+  CUENTA28_STATUS_COLORS
 } from './nominaConverter';
 
 // ============================================================================
@@ -438,10 +440,14 @@ function colIndexToLetters(index) {
   return s;
 }
 
-const VALUE_COLUMNS = new Set(['Valor Concepto', 'Valor Totales']);
+const VALUE_COLUMNS = new Set([
+  'Valor Concepto', 'Valor Totales',
+  'Valor Nómina', 'Valor Siigo', 'Diferencia', 'Nómina mes', 'Siigo mes'
+]);
 const FILL_HEXES = Object.keys(STATUS_COLORS);
 const NUMBER_STYLE_PLAIN = 2;
 const NUMBER_STYLE_FIRST_FILL = 3;
+const STATUS_STYLE_FIRST_FILL = NUMBER_STYLE_FIRST_FILL + FILL_HEXES.length;
 
 // Ancho de cada columna en el Excel exportado (en caracteres).
 const EXCEL_COLUMN_WIDTH = {
@@ -490,7 +496,10 @@ function buildSheetXml(dataRows, columns) {
           const style = VALUE_COLUMNS.has(colName) ? numberStyleFor(row) : 0;
           return `<c r="${ref}" s="${style}"><v>${val}</v></c>`;
         }
-        return `<c r="${ref}" t="inlineStr"><is><t>${xmlEscape(String(val))}</t></is></c>`;
+        const statusStyle = colName === 'Estado' && row._fill
+          ? STATUS_STYLE_FIRST_FILL + Math.max(0, FILL_HEXES.indexOf(row._fill))
+          : 0;
+        return `<c r="${ref}" s="${statusStyle}" t="inlineStr"><is><t>${xmlEscape(String(val))}</t></is></c>`;
       })
       .join('');
     xmlRows += `<row r="${rowNum}">${cells}</row>`;
@@ -510,11 +519,14 @@ function buildStylesXml() {
     `<xf numFmtId="164" fontId="0" fillId="${fillId}" borderId="0" xfId="0" applyNumberFormat="1"${
       fillId ? ' applyFill="1"' : ''
     }/>`;
+  const textFillXf = (fillId) =>
+    `<xf numFmtId="0" fontId="0" fillId="${fillId}" borderId="0" xfId="0" applyFill="1"/>`;
   const cellXfs =
     '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
     '<xf numFmtId="17" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="left"/></xf>' +
     numberXf(0) +
-    FILL_HEXES.map((_, i) => numberXf(i + 2)).join('');
+    FILL_HEXES.map((_, i) => numberXf(i + 2)).join('') +
+    FILL_HEXES.map((_, i) => textFillXf(i + 2)).join('');
 
   // numFmtId 164 = formato contable (ceros como "-"), igual que la Hoja2 de ejemplo;
   // numFmtId 17 = mmm-yy (integrado).
@@ -525,7 +537,7 @@ function buildStylesXml() {
     `<fills count="${FILL_HEXES.length + 2}">${fills}</fills>` +
     '<borders count="1"><border/></borders>' +
     '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
-    `<cellXfs count="${FILL_HEXES.length + 3}">${cellXfs}</cellXfs>` +
+    `<cellXfs count="${FILL_HEXES.length * 2 + 3}">${cellXfs}</cellXfs>` +
     '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>' +
     '</styleSheet>'
   );
@@ -573,6 +585,19 @@ const OUTPUT_COLUMNS = [
   'Valor Totales'
 ];
 
+const CUENTA28_COLUMNS = [
+  'Empresa',
+  'Mes',
+  'Empleado',
+  'Concepto',
+  'Valor Nómina',
+  'Valor Siigo',
+  'Diferencia',
+  'Estado',
+  'Nómina mes',
+  'Siigo mes'
+];
+
 // Ancho mínimo de cada columna en la tabla de la pantalla (px).
 const COLUMN_MIN_WIDTH = {
   'Mes elaboración': 150,
@@ -592,7 +617,11 @@ export default function App() {
   const [showInstructions, setShowInstructions] = useState(true);
   const [files, setFiles] = useState([]); // { fileId, fileName, empresa, sheets } | { ..., readError }
   const [unifyNames, setUnifyNames] = useState(true);
-  const [consolidateNomina, setConsolidateNomina] = useState(false);
+  const [modo, setModo] = useState('cuenta28');
+  const [estadoFilter, setEstadoFilter] = useState('TODOS');
+  const [mesFilter, setMesFilter] = useState('TODOS');
+  const [conceptoFilter, setConceptoFilter] = useState('TODOS');
+  const [empresaFilter, setEmpresaFilter] = useState('TODOS');
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
@@ -610,44 +639,57 @@ export default function App() {
     [files, unifyNames]
   );
 
-  // Consolidación de varios archivos de una misma empresa bajo la misma casilla:
-  // varias nóminas anchas (p. ej. los 4 a 6 archivos mensuales de RemoFirst) y/o
-  // varios Movimiento CC (p. ej. un archivo por rango de fechas). Es opcional
-  // porque los códigos de empleado / nombres de empresas distintas podrían
-  // repetirse y mezclar datos. Para el Movimiento CC, además, consolidar antes
-  // de convertir es lo que permite que la inferencia de empleado por fecha (en
-  // aportes patronales y en filas de salario sin Tercero) vea todas las filas de
-  // una misma fecha aunque hayan llegado en archivos distintos.
-  const nominaConsolidation = useMemo(() => {
-    if (!consolidateNomina) return null;
-    const inputs = processed
-      .filter((f) => f.sourceType === 'nomina' && f.nominaRows)
-      .map((f) => ({ rows: f.nominaRows, name: f.fileName }));
-    if (inputs.length < 2) return null;
-    return convertNominaFiles(inputs, { unifyNamesByCode: unifyNames });
-  }, [processed, consolidateNomina, unifyNames]);
+  const empresas = useMemo(
+    () => [...new Set(processed.map((f) => f.empresa).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    [processed]
+  );
 
-  const movimientoConsolidation = useMemo(() => {
-    if (!consolidateNomina) return null;
-    const inputs = processed
-      .filter((f) => f.sourceType === 'movimiento' && f.movimientoRows)
-      .map((f) => ({ rows: f.movimientoRows, name: f.fileName }));
-    if (inputs.length < 2) return null;
-    return convertMovimientoFiles(inputs);
-  }, [processed, consolidateNomina]);
+  const sourceRows = useMemo(() => {
+    const relevant = empresaFilter === 'TODOS'
+      ? processed
+      : processed.filter((f) => f.empresa === empresaFilter);
+    const nominaRows = relevant
+      .filter((f) => f.sourceType === 'nomina')
+      .flatMap((f) => f.rows);
+    const movimientoRows = relevant
+      .filter((f) => f.sourceType === 'movimiento')
+      .flatMap((f) => f.rows);
+    return { nominaRows, movimientoRows };
+  }, [processed, empresaFilter]);
+
+  const cuenta28 = useMemo(() => {
+    // El cruce se hace por empresa. No mezclamos personas/conceptos de compañías
+    // distintas aunque el usuario haya cargado todos los archivos juntos.
+    const relevant = empresaFilter === 'TODOS' ? processed : processed.filter((f) => f.empresa === empresaFilter);
+    if (empresaFilter !== 'TODOS') {
+      return cruzarCuenta28(sourceRows.nominaRows, sourceRows.movimientoRows);
+    }
+
+    const groups = new Map();
+    for (const f of relevant) {
+      if (!groups.has(f.empresa)) groups.set(f.empresa, { nomina: [], movimiento: [] });
+      if (f.sourceType === 'nomina') groups.get(f.empresa).nomina.push(...f.rows);
+      if (f.sourceType === 'movimiento') groups.get(f.empresa).movimiento.push(...f.rows);
+    }
+
+    const rows = [];
+    const summary = { total: 0, OK: 0, DIFERENCIA: 0, SOLO_NOMINA: 0, SOLO_SIIGO: 0, CRUZA_ENTRE_MESES: 0 };
+    const months = new Set();
+    for (const [empresa, group] of groups) {
+      const result = cruzarCuenta28(group.nomina, group.movimiento);
+      for (const row of result.rows) rows.push({ ...row, Empresa: empresa });
+      for (const m of result.months) months.add(m);
+      Object.keys(summary).forEach((key) => { summary[key] += result.summary[key] || 0; });
+    }
+    return { rows, summary, months: [...months].sort() };
+  }, [processed, empresaFilter, sourceRows]);
 
   const consolidatedRows = useMemo(() => {
-    const nominaRows = nominaConsolidation
-      ? nominaConsolidation.records
-      : processed.filter((f) => f.sourceType === 'nomina').flatMap((f) => f.rows);
-    const movimientoRows = movimientoConsolidation
-      ? movimientoConsolidation.records
-      : processed.filter((f) => f.sourceType === 'movimiento').flatMap((f) => f.rows);
-    const otherRows = processed
-      .filter((f) => f.sourceType !== 'nomina' && f.sourceType !== 'movimiento')
-      .flatMap((f) => f.rows);
-    return [...nominaRows, ...movimientoRows, ...otherRows];
-  }, [processed, nominaConsolidation, movimientoConsolidation]);
+    if (modo === 'cuenta28') {
+      return cuenta28.rows.map((row) => ({ ...row, Empresa: row.Empresa || empresaFilter }));
+    }
+    return [...sourceRows.nominaRows, ...sourceRows.movimientoRows];
+  }, [modo, cuenta28.rows, sourceRows]);
 
   // Colores presentes en el resultado, para la leyenda.
   const legendColors = useMemo(() => {
@@ -655,6 +697,12 @@ export default function App() {
     for (const row of consolidatedRows) if (row._fill) used.add(row._fill);
     return Object.keys(STATUS_COLORS).filter((hex) => used.has(hex));
   }, [consolidatedRows]);
+
+  const cuenta28Months = cuenta28.months;
+  const cuenta28Concepts = useMemo(
+    () => [...new Set(cuenta28.rows.map((r) => r.Concepto))].sort((a, b) => a.localeCompare(b)),
+    [cuenta28.rows]
+  );
 
   useEffect(() => {
     if (loading || !scrollPending.current) return;
@@ -706,15 +754,28 @@ export default function App() {
     setFiles([]);
     setSearchTerm('');
     setCurrentPage(1);
+    setEmpresaFilter('TODOS');
+    setEstadoFilter('TODOS');
+    setMesFilter('TODOS');
+    setConceptoFilter('TODOS');
   };
 
   const filteredData = useMemo(() => {
-    if (!searchTerm.trim()) return consolidatedRows;
+    let data = consolidatedRows;
+    if (modo === 'cuenta28') {
+      if (estadoFilter !== 'TODOS') data = data.filter((r) => r.Estado === estadoFilter);
+      if (mesFilter !== 'TODOS') data = data.filter((r) => r.Mes === mesFilter);
+      if (conceptoFilter !== 'TODOS') data = data.filter((r) => r.Concepto === conceptoFilter);
+    }
+    if (!searchTerm.trim()) return data;
     const term = searchTerm.toLowerCase();
-    return consolidatedRows.filter((row) =>
-      OUTPUT_COLUMNS.some((col) => formatCellValue(row[col]).toLowerCase().includes(term))
-    );
-  }, [consolidatedRows, searchTerm]);
+    return data.filter((row) => {
+      const values = modo === 'cuenta28'
+        ? [row.Mes, row.Empleado, row.Concepto, row['Valor Nómina'], row['Valor Siigo'], row.Diferencia, row.Estado]
+        : OUTPUT_COLUMNS.map((col) => row[col]);
+      return values.some((v) => formatCellValue(v).toLowerCase().includes(term));
+    });
+  }, [consolidatedRows, searchTerm, modo, estadoFilter, mesFilter, conceptoFilter]);
 
   const totalPages = Math.ceil(filteredData.length / rowsPerPage) || 1;
   const paginatedData = useMemo(() => {
@@ -726,11 +787,12 @@ export default function App() {
     if (filteredData.length === 0) return;
     setExporting(true);
     try {
-      const blob = await buildXlsxBlobWithJSZip(filteredData, OUTPUT_COLUMNS);
+      const exportColumns = modo === 'cuenta28' ? CUENTA28_COLUMNS : OUTPUT_COLUMNS;
+      const blob = await buildXlsxBlobWithJSZip(filteredData, exportColumns);
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = 'nomina_formato_largo.xlsx';
+      link.download = modo === 'cuenta28' ? 'cuenta_28_cruce.xlsx' : 'nomina_formato_largo.xlsx';
       link.click();
       URL.revokeObjectURL(url);
     } finally {
@@ -740,13 +802,11 @@ export default function App() {
 
   const downloadCSV = () => {
     if (filteredData.length === 0) return;
-    const headerLine = OUTPUT_COLUMNS.join(',');
-    // Los montos van como número plano (sin puntos de miles) para poder sumar y filtrar en Excel.
+    const columns = modo === 'cuenta28' ? CUENTA28_COLUMNS : OUTPUT_COLUMNS;
+    const headerLine = columns.join(',');
     const lines = filteredData.map((row) =>
-      OUTPUT_COLUMNS.map((col) =>
-        VALUE_COLUMNS.has(col)
-          ? String(row[col])
-          : `"${formatCellValue(row[col]).replace(/"/g, '""')}"`
+      columns.map((col) =>
+        typeof row[col] === 'number' ? String(row[col]) : `"${formatCellValue(row[col]).replace(/"/g, '""')}"`
       ).join(',')
     );
     const csvContent = [headerLine, ...lines].join('\n');
@@ -754,49 +814,50 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'nomina_formato_largo.csv';
+    link.download = modo === 'cuenta28' ? 'cuenta_28_cruce.csv' : 'nomina_formato_largo.csv';
     link.click();
     URL.revokeObjectURL(url);
   };
 
   const downloadJSON = () => {
     if (filteredData.length === 0) return;
-    // Las fechas se serializan como "yyyy-mm-dd" en vez del ISO string con
-    // hora que produciría JSON.stringify por defecto sobre un objeto Date.
+    const columns = modo === 'cuenta28' ? CUENTA28_COLUMNS : OUTPUT_COLUMNS;
     const serializable = filteredData.map((row) => {
       const obj = {};
-      OUTPUT_COLUMNS.forEach((col) => {
+      columns.forEach((col) => {
         obj[col] = row[col] instanceof Date ? formatCellValue(row[col]) : row[col];
       });
       return obj;
     });
-    const blob = new Blob([JSON.stringify(serializable, null, 2)], {
-      type: 'application/json'
-    });
+    const blob = new Blob([JSON.stringify(serializable, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'nomina_formato_largo.json';
+    link.download = modo === 'cuenta28' ? 'cuenta_28_cruce.json' : 'nomina_formato_largo.json';
     link.click();
     URL.revokeObjectURL(url);
   };
 
   const totalWarnings = processed.filter((f) => f.warning).length;
 
-  // Los ceros se muestran como "-" (igual que el formato contable del Excel) y los
-  // montos llevan el color que traía la nómina, en las dos columnas de valor.
+  const tableColumns = modo === 'cuenta28' ? CUENTA28_COLUMNS : OUTPUT_COLUMNS;
   const renderCell = (row, col) => {
     const value = row[col];
-    if (VALUE_COLUMNS.has(col) && value === 0) return '-';
+    if (modo === 'cuenta28' && ['Valor Nómina', 'Valor Siigo', 'Diferencia', 'Nómina mes', 'Siigo mes'].includes(col)) {
+      return Number(value || 0).toLocaleString('es-CO');
+    }
+    if (modo !== 'cuenta28' && VALUE_COLUMNS.has(col) && value === 0) return '-';
     return formatCellValue(value);
   };
   const cellClass = (col) => {
-    const base = 'px-5 py-2.5 whitespace-nowrap';
-    return VALUE_COLUMNS.has(col) ? `${base} text-right` : base;
+    const base = 'px-4 py-2.5 whitespace-nowrap';
+    return (modo === 'cuenta28' && ['Valor Nómina', 'Valor Siigo', 'Diferencia', 'Nómina mes', 'Siigo mes'].includes(col)) ||
+      (modo !== 'cuenta28' && VALUE_COLUMNS.has(col)) ? `${base} text-right` : base;
   };
   const cellStyle = (row, col) => {
-    const style = { minWidth: COLUMN_MIN_WIDTH[col] };
-    if (VALUE_COLUMNS.has(col) && row._fill) style.backgroundColor = `#${row._fill}`;
+    const style = { minWidth: modo === 'cuenta28' ? 150 : COLUMN_MIN_WIDTH[col] };
+    if (modo === 'cuenta28' && col === 'Estado' && row._fill) style.backgroundColor = `#${row._fill}`;
+    if (modo !== 'cuenta28' && VALUE_COLUMNS.has(col) && row._fill) style.backgroundColor = `#${row._fill}`;
     return style;
   };
 
@@ -817,12 +878,12 @@ export default function App() {
         {/* Título */}
         <div className="text-center space-y-3">
           <h1 className="text-3xl font-extrabold text-slate-900 tracking-tight">
-            Convertidor de Nómina / Movimiento CC a formato largo
+            Automatización y cruce de Cuenta 28
           </h1>
           <p className="text-sm text-slate-600 max-w-2xl mx-auto leading-relaxed">
-            Carga la nómina de cada empresa (.xlsx / .xlsm, la hoja ancha con un bloque por mes) o
-            el Movimiento CC de Siigo, y obtén la versión larga, lista para filtrar y para el
-            cruce de la cuenta 28. La app detecta sola cuál de los dos formatos es cada archivo.
+            Carga la nómina y el Movimiento CC de Siigo. La herramienta convierte ambos formatos,
+            cruza mes + empleado + concepto y muestra cruces correctos, diferencias, registros que
+            solo aparecen en un lado y conceptos que cruzan entre meses.
           </p>
         </div>
 
@@ -852,8 +913,8 @@ export default function App() {
                 encuentra bloques, como Movimiento CC. Puedes seleccionar varios archivos a la vez,
                 incluso mezclando los dos tipos. Si son varios archivos de una misma empresa —
                 varias nóminas (p. ej. los de RemoFirst) o varios Movimiento CC (p. ej. uno por
-                rango de fechas) — marca la casilla de consolidar para que se junten antes de
-                convertir.
+                rango de fechas) — se pueden cargar juntos; la herramienta los agrupa por empresa
+                antes de hacer el cruce.
               </p>
               <p>
                 <strong className="text-slate-900">2. Qué sale de la nómina:</strong> una fila por
@@ -871,22 +932,70 @@ export default function App() {
                 Lo que no se reconoce queda con el texto de Descripción y se avisa.
               </p>
               <p>
-                <strong className="text-slate-900">4. Colores:</strong> son los que ya trae el
+                <strong className="text-slate-900">4. Cruce Cuenta 28:</strong> se compara por empresa,
+                mes, empleado y concepto. Verde = OK, rojo = diferencia, amarillo = solo aparece en
+                un lado y verde = cruza entre meses para conceptos acumulativos como la prima.
+              </p>
+              <p>
+                <strong className="text-slate-900">5. Colores del archivo:</strong> son los que ya trae el
                 archivo (el resultado del cruce con Siigo): verde y azul = cruce ok, amarillo = no
                 está en el otro lado, rojo = diferencias, verde limón = cruza entre meses, morado =
                 débito y crédito se anulan. Si el archivo aún no está pintado, las filas salen sin
                 color.
               </p>
               <p>
-                <strong className="text-slate-900">5. Los avisos</strong> bajo cada archivo indican
+                <strong className="text-slate-900">6. Los avisos</strong> bajo cada archivo indican
                 qué formato se reconoció y si algo no cuadra (un total que no coincide, colores
                 fuera de la leyenda, filas sin fecha válida, etc.). Nada se descarta en silencio.
               </p>
               <p>
-                <strong className="text-slate-900">6. Exportar:</strong> descarga el resultado
+                <strong className="text-slate-900">7. Exportar:</strong> descarga el resultado
                 consolidado en Excel (con los colores y el formato contable), CSV o JSON.
               </p>
             </div>
+          )}
+        </div>
+
+        {/* Modo y filtros Cuenta 28 */}
+        <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-sm font-bold text-slate-800">Modo:</span>
+            <button onClick={() => setModo('cuenta28')} className={`px-4 py-2 rounded-lg text-xs font-semibold ${modo === 'cuenta28' ? 'bg-blue-900 text-white' : 'bg-slate-100 text-slate-600'}`}>Cuenta 28</button>
+            <button onClick={() => setModo('largo')} className={`px-4 py-2 rounded-lg text-xs font-semibold ${modo === 'largo' ? 'bg-blue-900 text-white' : 'bg-slate-100 text-slate-600'}`}>Formato largo</button>
+          </div>
+          {modo === 'cuenta28' && (
+            <>
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                <select value={empresaFilter} onChange={(e) => { setEmpresaFilter(e.target.value); setCurrentPage(1); }} className="border border-slate-200 rounded-lg px-3 py-2 text-xs">
+                  <option value="TODOS">Todas las empresas</option>
+                  {empresas.map((e) => <option key={e} value={e}>{e}</option>)}
+                </select>
+                <select value={estadoFilter} onChange={(e) => { setEstadoFilter(e.target.value); setCurrentPage(1); }} className="border border-slate-200 rounded-lg px-3 py-2 text-xs">
+                  <option value="TODOS">Todos los estados</option>
+                  <option value="OK">🟢 Cruce OK</option>
+                  <option value="DIFERENCIA">🔴 Diferencias</option>
+                  <option value="SOLO_NOMINA">🟡 Solo nómina</option>
+                  <option value="SOLO_SIIGO">🟡 Solo Siigo</option>
+                  <option value="CRUZA_ENTRE_MESES">🟢 Cruza entre meses</option>
+                </select>
+                <select value={mesFilter} onChange={(e) => { setMesFilter(e.target.value); setCurrentPage(1); }} className="border border-slate-200 rounded-lg px-3 py-2 text-xs">
+                  <option value="TODOS">Todos los meses</option>
+                  {cuenta28Months.map((m) => <option key={m} value={m}>{m}</option>)}
+                </select>
+                <select value={conceptoFilter} onChange={(e) => { setConceptoFilter(e.target.value); setCurrentPage(1); }} className="border border-slate-200 rounded-lg px-3 py-2 text-xs">
+                  <option value="TODOS">Todos los conceptos</option>
+                  {cuenta28Concepts.map((c) => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+                <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
+                {[['Total', cuenta28.summary.total], ['OK', cuenta28.summary.OK], ['Diferencias', cuenta28.summary.DIFERENCIA], ['Solo nómina', cuenta28.summary.SOLO_NOMINA], ['Solo Siigo', cuenta28.summary.SOLO_SIIGO], ['Cruza meses', cuenta28.summary.CRUZA_ENTRE_MESES]].map(([label, value]) => (
+                  <div key={label} className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                    <div className="text-[11px] text-slate-500">{label}</div>
+                    <div className="text-xl font-extrabold text-slate-800">{value}</div>
+                  </div>
+                ))}
+              </div>
+            </>
           )}
         </div>
 
@@ -940,14 +1049,6 @@ export default function App() {
                     onChange={(e) => setUnifyNames(e.target.checked)}
                   />
                   Unificar el nombre de cada empleado por código (solo nómina)
-                </label>
-                <label className="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={consolidateNomina}
-                    onChange={(e) => setConsolidateNomina(e.target.checked)}
-                  />
-                  Varios archivos de una misma empresa (nómina y/o Movimiento CC): consolidar
                 </label>
                 <button
                   onClick={clearAll}
@@ -1007,36 +1108,6 @@ export default function App() {
                 )}
               </div>
             ))}
-            {nominaConsolidation && (
-              <div className="px-3 py-2 rounded-lg border border-blue-200 bg-blue-50/60 text-xs space-y-1">
-                <p className="font-semibold text-blue-900">Consolidación de nóminas</p>
-                <ul className="pl-4 space-y-1">
-                  {nominaConsolidation.notes.map((n, i) => (
-                    <li
-                      key={i}
-                      className={n.type === 'warn' ? 'text-amber-800' : 'text-slate-600'}
-                    >
-                      {n.text}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {movimientoConsolidation && (
-              <div className="px-3 py-2 rounded-lg border border-blue-200 bg-blue-50/60 text-xs space-y-1">
-                <p className="font-semibold text-blue-900">Consolidación de Movimiento CC</p>
-                <ul className="pl-4 space-y-1">
-                  {movimientoConsolidation.notes.map((n, i) => (
-                    <li
-                      key={i}
-                      className={n.type === 'warn' ? 'text-amber-800' : 'text-slate-600'}
-                    >
-                      {n.text}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
             {totalWarnings > 0 && (
               <p className="text-xs text-amber-700 pt-1">
                 {totalWarnings} archivo(s) no generaron filas — revisa que sean la nómina o el
@@ -1060,7 +1131,7 @@ export default function App() {
                   <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
                   <input
                     type="text"
-                    placeholder="Buscar empleado, concepto, mes..."
+                    placeholder="Buscar empleado, concepto, mes, estado..."
                     value={searchTerm}
                     onChange={(e) => {
                       setSearchTerm(e.target.value);
@@ -1114,7 +1185,7 @@ export default function App() {
                 <table className="w-full text-left text-xs text-slate-700">
                   <thead className="bg-slate-100 uppercase text-slate-500 sticky top-0 border-b border-slate-200 font-semibold">
                     <tr>
-                      {OUTPUT_COLUMNS.map((col) => (
+                      {tableColumns.map((col) => (
                         <th
                           key={col}
                           className="px-5 py-3 whitespace-nowrap"
@@ -1128,7 +1199,7 @@ export default function App() {
                   <tbody className="divide-y divide-slate-100">
                     {paginatedData.map((row, idx) => (
                       <tr key={idx} className="hover:bg-slate-50 transition-colors">
-                        {OUTPUT_COLUMNS.map((col) => (
+                        {tableColumns.map((col) => (
                           <td key={col} className={cellClass(col)} style={cellStyle(row, col)}>
                             {renderCell(row, col)}
                           </td>
