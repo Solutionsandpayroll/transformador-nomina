@@ -866,7 +866,7 @@ export default function App() {
       {/* Header */}
       <header className="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between shadow-sm">
         <div className="flex items-center gap-3">
-          <img src="/logo.jpeg" alt="Logo" className="h-14 w-auto object-contain cursor-pointer" />
+          <img src="/logo.jpeg" alt="Logo" className="h-14 w-auto object-contain" />
         </div>
         <div className="flex items-center gap-2.5 border border-slate-200 bg-slate-50 px-5 py-2 rounded-full text-sm font-semibold text-slate-700 cursor-pointer hover:bg-slate-100 transition-colors">
           <User className="w-4 h-4 text-blue-600" />
@@ -878,7 +878,7 @@ export default function App() {
         {/* Título */}
         <div className="text-center space-y-3">
           <h1 className="text-3xl font-extrabold text-slate-900 tracking-tight">
-            Automatización y cruce de Cuenta 28
+            Automatización y Cruce Contable
           </h1>
           <p className="text-sm text-slate-600 max-w-2xl mx-auto leading-relaxed">
             Carga la nómina y el Movimiento CC de Siigo. La herramienta convierte ambos formatos,
@@ -932,7 +932,7 @@ export default function App() {
                 Lo que no se reconoce queda con el texto de Descripción y se avisa.
               </p>
               <p>
-                <strong className="text-slate-900">4. Cruce Cuenta 28:</strong> se compara por empresa,
+                <strong className="text-slate-900">4. Cruce contable:</strong> se compara por empresa,
                 mes, empleado y concepto. Verde = OK, rojo = diferencia, amarillo = solo aparece en
                 un lado y verde = cruza entre meses para conceptos acumulativos como la prima.
               </p>
@@ -960,17 +960,43 @@ export default function App() {
         <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
           <div className="flex flex-wrap items-center gap-3">
             <span className="text-sm font-bold text-slate-800">Modo:</span>
-            <button onClick={() => setModo('cuenta28')} className={`px-4 py-2 rounded-lg text-xs font-semibold ${modo === 'cuenta28' ? 'bg-blue-900 text-white' : 'bg-slate-100 text-slate-600'}`}>Cuenta 28</button>
-            <button onClick={() => setModo('largo')} className={`px-4 py-2 rounded-lg text-xs font-semibold ${modo === 'largo' ? 'bg-blue-900 text-white' : 'bg-slate-100 text-slate-600'}`}>Formato largo</button>
+            <button
+              onClick={() => setModo('cuenta28')}
+              className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                modo === 'cuenta28'
+                  ? 'bg-blue-900 text-white'
+                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+              }`}
+            >
+              Cruce contable
+            </button>
+            <button
+              onClick={() => setModo('largo')}
+              className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                modo === 'largo'
+                  ? 'bg-blue-900 text-white'
+                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+              }`}
+            >
+              Formato largo
+            </button>
           </div>
           {modo === 'cuenta28' && (
             <>
               <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-                <select value={empresaFilter} onChange={(e) => { setEmpresaFilter(e.target.value); setCurrentPage(1); }} className="border border-slate-200 rounded-lg px-3 py-2 text-xs">
+                <select
+                  value={empresaFilter}
+                  onChange={(e) => { setEmpresaFilter(e.target.value); setCurrentPage(1); }}
+                  className="border border-slate-200 rounded-lg px-3 py-2 text-xs cursor-pointer hover:border-slate-300 focus:outline-none focus:border-blue-500 transition-colors"
+                >
                   <option value="TODOS">Todas las empresas</option>
                   {empresas.map((e) => <option key={e} value={e}>{e}</option>)}
                 </select>
-                <select value={estadoFilter} onChange={(e) => { setEstadoFilter(e.target.value); setCurrentPage(1); }} className="border border-slate-200 rounded-lg px-3 py-2 text-xs">
+                <select
+                  value={estadoFilter}
+                  onChange={(e) => { setEstadoFilter(e.target.value); setCurrentPage(1); }}
+                  className="border border-slate-200 rounded-lg px-3 py-2 text-xs cursor-pointer hover:border-slate-300 focus:outline-none focus:border-blue-500 transition-colors"
+                >
                   <option value="TODOS">Todos los estados</option>
                   <option value="OK">🟢 Cruce OK</option>
                   <option value="DIFERENCIA">🔴 Diferencias</option>
@@ -978,11 +1004,19 @@ export default function App() {
                   <option value="SOLO_SIIGO">🟡 Solo Siigo</option>
                   <option value="CRUZA_ENTRE_MESES">🟢 Cruza entre meses</option>
                 </select>
-                <select value={mesFilter} onChange={(e) => { setMesFilter(e.target.value); setCurrentPage(1); }} className="border border-slate-200 rounded-lg px-3 py-2 text-xs">
+                <select
+                  value={mesFilter}
+                  onChange={(e) => { setMesFilter(e.target.value); setCurrentPage(1); }}
+                  className="border border-slate-200 rounded-lg px-3 py-2 text-xs cursor-pointer hover:border-slate-300 focus:outline-none focus:border-blue-500 transition-colors"
+                >
                   <option value="TODOS">Todos los meses</option>
                   {cuenta28Months.map((m) => <option key={m} value={m}>{m}</option>)}
                 </select>
-                <select value={conceptoFilter} onChange={(e) => { setConceptoFilter(e.target.value); setCurrentPage(1); }} className="border border-slate-200 rounded-lg px-3 py-2 text-xs">
+                <select
+                  value={conceptoFilter}
+                  onChange={(e) => { setConceptoFilter(e.target.value); setCurrentPage(1); }}
+                  className="border border-slate-200 rounded-lg px-3 py-2 text-xs cursor-pointer hover:border-slate-300 focus:outline-none focus:border-blue-500 transition-colors"
+                >
                   <option value="TODOS">Todos los conceptos</option>
                   {cuenta28Concepts.map((c) => <option key={c} value={c}>{c}</option>)}
                 </select>
@@ -1047,6 +1081,7 @@ export default function App() {
                     type="checkbox"
                     checked={unifyNames}
                     onChange={(e) => setUnifyNames(e.target.checked)}
+                    className="cursor-pointer"
                   />
                   Unificar el nombre de cada empleado por código (solo nómina)
                 </label>
@@ -1144,22 +1179,24 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <button
                     onClick={downloadXLSX}
-                    disabled={exporting}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-900 hover:bg-blue-800 disabled:opacity-50 text-white font-medium text-xs rounded-lg transition-colors cursor-pointer"
+                    disabled={exporting || filteredData.length === 0}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-900 hover:bg-blue-800 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium text-xs rounded-lg transition-colors cursor-pointer"
                   >
                     <FileSpreadsheet className="w-3.5 h-3.5" />
                     {exporting ? 'Generando...' : 'Excel'}
                   </button>
                   <button
                     onClick={downloadCSV}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white font-medium text-xs rounded-lg transition-colors cursor-pointer"
+                    disabled={filteredData.length === 0}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium text-xs rounded-lg transition-colors cursor-pointer"
                   >
                     <FileSpreadsheet className="w-3.5 h-3.5" />
                     CSV
                   </button>
                   <button
                     onClick={downloadJSON}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-slate-800 text-white font-medium text-xs rounded-lg transition-colors cursor-pointer"
+                    disabled={filteredData.length === 0}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium text-xs rounded-lg transition-colors cursor-pointer"
                   >
                     <Download className="w-3.5 h-3.5" />
                     JSON
