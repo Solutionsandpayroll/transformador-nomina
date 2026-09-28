@@ -12,20 +12,25 @@
 //
 // Cómo se lee la nómina (todas las empresas la arman distinto, así que NO hay
 // columnas fijas):
-//   - Cada bloque mensual empieza con una fila de encabezado que trae un
-//     encabezado de "código de empleado" y uno de "nombre" (ver
-//     CODE_HEADER_ALIASES / NAME_HEADER_ALIASES más abajo — RemoFirst usa
-//     "EMPLOYEE CODE" / "NAME", pero cada empresa nueva puede traer otra
-//     redacción; agrega el alias ahí en vez de tocar la lógica). Los
-//     conceptos son los encabezados de las columnas que están a la derecha
-//     de la columna de nombre, en el mismo orden en que aparecen.
-//   - El mes sale del rótulo de la columna A ("Junio 2026", "MAYO"...). Si el
-//     rótulo no trae año se deduce por la secuencia de bloques.
+//   - Cada bloque empieza con una fila de encabezado que trae un encabezado de
+//     "código de empleado" y uno de "nombre" (ver DEFAULT_CODE_HEADER_ALIASES /
+//     DEFAULT_NAME_HEADER_ALIASES más abajo — RemoFirst usa "EMPLOYEE CODE" /
+//     "NAME"; cada empresa nueva puede traer otra redacción: agrega el alias
+//     ahí en vez de tocar la lógica). Los conceptos son los encabezados de las
+//     columnas que están a la derecha de la columna de nombre.
+//   - El mes se lee de DOS maneras:
+//       1) Si el encabezado trae una columna de mes ("PAYROLL MONTH", "MES
+//          NOMINA", "PERIODO" — es el caso de RemoFirst, con valores en inglés
+//          y sin año: "August", "July"...), el mes sale de esa columna en cada
+//          fila de empleado.
+//       2) Si no, del rótulo de la columna A ("Junio 2026", "MAYO"...).
+//     Si el mes no trae año se deduce por la secuencia de bloques o, si no hay
+//     ninguna referencia, se usa options.defaultYear.
 //   - Se ignoran los subtotales (PAYMENTS, TOTAL...), las columnas en USD, FEE y
 //     tasa de cambio, y las filas de control que Excel repite debajo de cada empleado.
-//   - Cada empleado de cada bloque lleva su propio TOTAL EMPLOYEE COST, así dos
-//     corridas de nómina del mismo mes (p. ej. una con bonificación aparte) salen
-//     separadas, igual que en el ejemplo.
+//   - BANKING TAX (que en RemoFirst está a la derecha de TOTAL EMPLOYEE COST pero
+//     sí forma parte de él) se lee como un concepto más.
+//   - Cada empleado de cada bloque lleva su propio TOTAL EMPLOYEE COST.
 //   - Los valores en cero no se listan. El color de cada valor es el relleno que
 //     tenía la celda en la nómina.
 
@@ -54,8 +59,13 @@ const NON_CONCEPT_EXACT = new Set([
   'COUNTRY',
   'PAYROLL MONTH',
   'SERVICE TYPE / INVOICE TYPE',
-  'ER SS RATE %'
+  'ER SS RATE %',
+  'CUSTOMER NAME',
+  'CUSTOMER ID'
 ]);
+
+// Encabezados que identifican la columna de mes en la fila de encabezado del bloque.
+const MONTH_HEADER_ALIASES = ['PAYROLL MONTH', 'MES NOMINA', 'PERIODO'];
 
 // Filas que traen algo en la columna NAME pero no son empleados.
 const NOT_AN_EMPLOYEE = /^(TOTAL|NOMINA|CONTABILIDAD|NOVEDAD|NOVADADES|DIFERENCIA|CRUCE|NO ESTA)/;
@@ -64,12 +74,9 @@ const NOT_AN_EMPLOYEE = /^(TOTAL|NOMINA|CONTABILIDAD|NOVEDAD|NOVADADES|DIFERENCI
 const SUMMARY_LABEL = /^(CRUCE|NO ESTA EN EL OTRO|DIFERENCIAS|CRUZA ENTRE|DEBITO - CREDITO)/;
 
 // Encabezados que identifican la columna de "código de empleado" y la de
-// "nombre" en la fila de encabezado de cada bloque mensual. RemoFirst usa el
-// texto en inglés ("EMPLOYEE CODE" / "NAME"); a medida que llegan archivos de
-// otras empresas, agrega aquí la variante exacta que traigan (en mayúsculas y
-// sin tildes, que es como los deja `norm()`) — no hace falta tocar el resto
-// del código. Si al convertir un archivo nuevo el resultado sale vacío, lo
-// primero que hay que revisar es si su encabezado real está en estas listas.
+// "nombre" (en mayúsculas y sin tildes, que es como los deja `norm()`).
+// Si al convertir un archivo nuevo el resultado sale vacío, lo primero que hay
+// que revisar es si su encabezado real está en estas listas.
 const DEFAULT_CODE_HEADER_ALIASES = [
   'EMPLOYEE CODE',
   'CODIGO',
@@ -105,6 +112,22 @@ const MONTHS = [
   ['OCTUBRE', 10],
   ['NOVIEMBRE', 11],
   ['DICIEMBRE', 12]
+];
+
+// Meses en inglés (RemoFirst trae la columna "Payroll Month" así: "August").
+const MONTHS_EN = [
+  ['JANUARY', 1],
+  ['FEBRUARY', 2],
+  ['MARCH', 3],
+  ['APRIL', 4],
+  ['MAY', 5],
+  ['JUNE', 6],
+  ['JULY', 7],
+  ['AUGUST', 8],
+  ['SEPTEMBER', 9],
+  ['OCTOBER', 10],
+  ['NOVEMBER', 11],
+  ['DECEMBER', 12]
 ];
 
 // Cuando un empleado no se pudo determinar (p. ej. un aporte patronal sin
@@ -152,6 +175,7 @@ function cellFill(cell) {
 }
 
 // "Junio 2026" -> {month: 6, year: 2026}; "MAYO " -> {month: 5, year: null}.
+// Rótulo de la columna A (español).
 function parseMonthLabel(text) {
   if (typeof text !== 'string') return null;
   const t = norm(text);
@@ -159,6 +183,24 @@ function parseMonthLabel(text) {
   for (const [name, num] of MONTHS) {
     if (t.includes(name)) {
       const y = /(20\d{2})/.exec(t);
+      return { month: num, year: y ? Number(y[1]) : null };
+    }
+  }
+  return null;
+}
+
+// Valor de una celda de la columna de mes ("August", "Julio 2026", "AUG"...).
+// Acepta español e inglés, pero solo por palabra completa (o abreviatura de
+// 3 letras) para no confundir textos como "MAYORGA" con un mes.
+function parseMonthCell(text) {
+  if (typeof text !== 'string') return null;
+  const t = norm(text);
+  if (!t || t.length > 30) return null;
+  const word = t.replace(/[^A-Z]/g, ' ').trim().split(' ')[0];
+  if (!word) return null;
+  const y = /(20\d{2})/.exec(t);
+  for (const [name, num] of [...MONTHS, ...MONTHS_EN]) {
+    if (word === name || word === name.slice(0, 3)) {
       return { month: num, year: y ? Number(y[1]) : null };
     }
   }
@@ -187,6 +229,7 @@ function readHeader(row, codeAliases, nameAliases) {
 
   const tec = leaves.find((l) => l.upper === 'TOTAL EMPLOYEE COST');
   const payments = leaves.find((l) => l.upper === 'PAYMENTS');
+  const monthLeaf = leaves.find((l) => MONTH_HEADER_ALIASES.includes(l.upper));
   const limit = tec ? tec.idx : Infinity; // lo que va después (FEE, USD...) no es costo
 
   let concepts = leaves.filter((l) => {
@@ -203,13 +246,19 @@ function readHeader(row, codeAliases, nameAliases) {
   const hasBreakdown = concepts.some((l) => l.upper === 'INTEGRATED SALARY' || l.upper === 'ORDINARY SALARY');
   if (hasBreakdown) concepts = concepts.filter((l) => l.upper !== 'SALARY');
 
+  // BANKING TAX está a la derecha de TOTAL EMPLOYEE COST (después del límite),
+  // pero el TOTAL EMPLOYEE COST de la hoja SÍ lo incluye: se agrega como concepto.
+  const banking = leaves.find((l) => l.upper === 'BANKING TAX');
+  if (banking && !concepts.includes(banking)) concepts.push(banking);
+
   if (concepts.length === 0) return null;
   return {
     codeCol,
     nameCol,
     concepts,
     tecCol: tec ? tec.idx : null,
-    paymentsCol: payments ? payments.idx : null
+    paymentsCol: payments ? payments.idx : null,
+    monthCol: monthLeaf ? monthLeaf.idx : null
   };
 }
 
@@ -234,7 +283,8 @@ export function convertNominaRows(rows, options = {}) {
     options.nameHeaderAliases || [...DEFAULT_NAME_HEADER_ALIASES, ...(options.extraNameHeaderAliases || [])]
   ).map(norm);
 
-  const labelEvents = []; // rótulos de mes encontrados, en orden
+  const labelEvents = []; // meses encontrados (rótulos o columna de mes), en orden
+  const monthEventIdx = new Map(); // "año-mes" -> índice en labelEvents (columna de mes)
   const entries = []; // empleado-bloque
   const blockInfo = new Map(); // blockId -> { employees: n, checkFill }
   let header = null;
@@ -278,6 +328,21 @@ export function convertNominaRows(rows, options = {}) {
         info.checkFill = statusFill(cellFill(row[header.tecCol]));
       }
       continue;
+    }
+
+    // Si el bloque trae columna de mes (RemoFirst: "Payroll Month"), el mes de
+    // ESTA fila sale de ahí; un mismo bloque puede mezclar meses (ajustes de
+    // julio, abril... dentro de la facturación de agosto).
+    if (header.monthCol !== null) {
+      const p = parseMonthCell(cellValue(row[header.monthCol]));
+      if (p) {
+        const k = `${p.year ?? ''}-${p.month}`;
+        if (!monthEventIdx.has(k)) {
+          labelEvents.push({ ...p });
+          monthEventIdx.set(k, labelEvents.length - 1);
+        }
+        curLabel = monthEventIdx.get(k);
+      }
     }
 
     blockInfo.get(blockId).employees += 1;
@@ -539,9 +604,8 @@ export function convertNominaFiles(files, options = {}) {
 // Crédito | Saldo Movimiento (el orden de columnas puede variar entre
 // empresas; se detectan por el nombre del encabezado, no por posición fija).
 //
-// A diferencia de la versión anterior (una fila cruda por movimiento), esta
-// versión reproduce el mismo resumen "tipo nómina" que se arma a mano en
-// Excel con Tabla dinámica / SUMIFS:
+// Reproduce el mismo resumen "tipo nómina" que se arma a mano en Excel con
+// Tabla dinámica / SUMIFS:
 //
 //   1. Cada Descripción se clasifica a un concepto tipo nómina (SALARY,
 //      Transport allowance, PENSION COST, HEALTH COST...) usando la tabla
@@ -549,54 +613,36 @@ export function convertNominaFiles(files, options = {}) {
 //      "Mapeo" del Excel. Es la primera palabra clave que aparece como
 //      substring de la Descripción (sin tildes ni mayúsculas/minúsculas).
 //      Si no coincide con ninguna, el concepto queda tal cual venía en
-//      Descripción (igual que antes) y se marca como "sin clasificar" en
-//      los avisos, para que edites CONCEPT_KEYWORDS y no quede escondido.
+//      Descripción y se marca como "sin clasificar" en los avisos.
 //
 //   2. Empleado: en las filas de salario/prestaciones (grupo 'empleado')
-//      Tercero normalmente YA es el nombre del empleado. Pero cuando ese
-//      Movimiento CC viene sin Tercero diligenciado en esas filas (pasa en
-//      algunos meses/archivos), y en los aportes patronales (pensión, EPS,
-//      caja de compensación, ARL — grupo 'aporte'), donde Tercero es la
-//      entidad (Porvenir, Sanitas...) y nunca el empleado, el empleado se
-//      infiere igual en ambos casos: se busca, en la MISMA fecha de
-//      elaboración, qué empleado aparece en alguna fila del grupo
-//      'empleado' que sí trajo Tercero (normalmente el comprobante de
-//      nómina de ese mismo cierre). Si en esa fecha hay un solo empleado
-//      candidato, se le asigna. Si hay varios (empresa con más de un
-//      empleado pagado el mismo día) o ninguno, la fila queda marcada como
-//      "(sin asignar)" en vez de adivinar.
+//      Tercero normalmente YA es el nombre del empleado. Cuando viene vacío,
+//      y en los aportes patronales (grupo 'aporte', donde Tercero es la
+//      entidad), el empleado se infiere: se busca, en la MISMA fecha de
+//      elaboración, qué empleado aparece en alguna fila del grupo 'empleado'
+//      que sí trajo Tercero. Si hay un solo candidato se le asigna; si hay
+//      varios o ninguno, la fila queda "(sin asignar)" en vez de adivinar.
 //
-//   3. Las filas de ingreso/facturación al cliente (grupo 'excluir': "EO
-//      Third parties service...", "Ingresos recibidos...") no son costo de
-//      un empleado, así que no entran al resumen.
+//   3. Las filas de ingreso/facturación al cliente (grupo 'excluir') no son
+//      costo de un empleado, así que no entran al resumen.
 //
 //   4. Se agrupa por (Mes, Concepto, Empleado) sumando "Valor Concepto"
-//      (Débito - Crédito) — el equivalente a SUMIFS. Y se agrega una fila
-//      TOTAL EMPLOYEE COST por (Mes, Empleado), sumando todo lo que sí se
-//      pudo atribuir a ese empleado ese mes — el mismo patrón que usa
-//      convertNominaRows.
+//      (Débito - Crédito) y se agrega una fila TOTAL EMPLOYEE COST por
+//      (Mes, Empleado).
 //
-//   5. Las filas de salida quedan ordenadas por Mes, luego Empleado y,
-//      dentro de cada mes-empleado, en el orden en que los conceptos
-//      aparecieron en el extracto contable, con TOTAL EMPLOYEE COST al
-//      final del bloque — igual que en la Hoja2 de referencia.
+//   5. Las filas de salida quedan ordenadas por Mes, luego Empleado y, dentro
+//      de cada mes-empleado, en el orden en que los conceptos aparecieron en
+//      el extracto, con TOTAL EMPLOYEE COST al final del bloque.
 //
 //   6. Cuando se juntan varios archivos de Movimiento CC (ver
-//      convertMovimientoFiles más abajo), cada archivo trae su propio
-//      resumen del cruce al final ("CRUCE OK", "DIFERENCIAS"...); al
-//      llegar a ese resumen la lectura no se detiene, solo cierra el
-//      bloque actual y sigue buscando el encabezado del siguiente archivo,
-//      para que ninguno de los archivos consolidados se pierda.
+//      convertMovimientoFiles), cada archivo trae su propio resumen del cruce
+//      al final; al llegar a él la lectura no se detiene, solo cierra el
+//      bloque actual y sigue buscando el encabezado del siguiente archivo.
 //
-// Esta función sigue devolviendo las mismas columnas de siempre (Mes
-// elaboración | Concepto | Empleado | Valor Concepto | Valor Totales), así
-// que App.jsx no necesita ningún cambio.
+// Devuelve las mismas columnas de siempre (Mes elaboración | Concepto |
+// Empleado | Valor Concepto | Valor Totales), así que App.jsx no necesita cambios.
 
-// Tabla de clasificación — el equivalente en código a la hoja "Mapeo" del
-// Excel. Se evalúa en orden, con la primera palabra clave (normalizada, sin
-// tildes/mayúsculas) que aparezca dentro de la Descripción. Agrega aquí una
-// fila nueva si aparece un concepto que todavía no se reconoce (los avisos
-// del resultado te dicen cuáles quedaron "sin clasificar").
+// Tabla de clasificación — el equivalente en código a la hoja "Mapeo" del Excel.
 //
 //   group: 'empleado' -> Tercero, cuando viene diligenciado, ya es el nombre
 //                        del empleado; si viene vacío se infiere por fecha.
@@ -727,11 +773,8 @@ export function convertMovimientoRows(rows, options = {}) {
 
     if (!comprobanteVal && MOVIMIENTO_STOP_LABEL.test(norm(descripcionVal))) {
       // Resumen del cruce al final de ESTE archivo. No se corta la lectura
-      // por completo (antes hacía `break` y, al consolidar varios archivos
-      // de Movimiento CC en un solo array, eso dejaba sin procesar todo lo
-      // que venía después del primer archivo). En vez de eso, se cierra el
-      // bloque actual y se vuelve a buscar un encabezado válido: si hay más
-      // filas, serán las del siguiente archivo concatenado.
+      // por completo: se cierra el bloque actual y se vuelve a buscar un
+      // encabezado válido (las filas siguientes serían del siguiente archivo).
       started = false;
       header = null;
       continue;
@@ -784,15 +827,10 @@ export function convertMovimientoRows(rows, options = {}) {
     parsedRows.push({ monthDate, dKey, comprobante: comprobanteVal, concepto, group, tercero: terceroVal, value, fill });
   }
 
-  if (!header || dataRows === 0) return null;
+  // (no se exige `header`: al llegar al resumen del cruce se reinicia a null)
+  if (dataRows === 0) return null;
 
   // --- Pasada 2: resolver el empleado ---------------------------------------------
-  // Grupo 'empleado' con Tercero diligenciado: Tercero ya es el nombre, se usa tal
-  // cual. Cualquier otra fila sin nombre propio (aportes patronales, o filas de
-  // salario/prestación que vinieron sin Tercero en el Movimiento CC) se infiere
-  // igual: se busca qué empleado aparece, en esa misma fecha, en alguna fila del
-  // grupo 'empleado' que sí trajo Tercero. Si hay un único candidato, se le asigna
-  // también esa fila; si hay varios o ninguno, queda "(sin asignar)".
   let ambiguousSinTercero = 0;
   let unresolvedSinTercero = 0;
   for (const pr of parsedRows) {
@@ -866,8 +904,7 @@ export function convertMovimientoRows(rows, options = {}) {
 
   // --- Orden de salida -------------------------------------------------------------
   // Mes -> Empleado -> conceptos en el orden en que aparecieron en el extracto,
-  // con TOTAL EMPLOYEE COST al final de cada bloque mes-empleado. Así queda
-  // igual a como se arma la Hoja2 a mano.
+  // con TOTAL EMPLOYEE COST al final de cada bloque mes-empleado.
   const firstSeen = new Map(); // "mes|empleado|concepto" -> índice de aparición
   parsedRows.forEach((pr, idx) => {
     const key = `${monthKey(pr.monthDate)}|${pr.empleado || SIN_EMPLEADO}|${pr.concepto}`;
@@ -965,19 +1002,11 @@ export function convertMovimientoRows(rows, options = {}) {
 // --- Consolidar varios Movimiento CC (varios archivos, p. ej. uno por rango de
 // fechas o por corrida contable) en un solo resultado -----------------------------
 // Igual que convertNominaFiles: junta las filas de todos los archivos antes de
-// convertir, en el orden en que los subas (idealmente cronológico), y llama a
-// convertMovimientoRows una sola vez sobre el conjunto completo. Esto importa
-// especialmente aquí porque la inferencia de empleado por fecha (aportes
-// patronales, o filas de salario/prestación sin Tercero) necesita ver, para una
-// fecha dada, todas las filas de esa fecha aunque hayan llegado en archivos
-// distintos.
-//
-// Uso desde App.jsx: en vez de llamar convertMovimientoRows por cada archivo de
-// Movimiento CC leído, junta las hojas en `files` y llama a esta función una
-// sola vez; el resultado (records + notes) es el que se exporta a la Hoja2.
+// convertir y llama a convertMovimientoRows una sola vez. Importa porque la
+// inferencia de empleado por fecha necesita ver, para una fecha dada, todas las
+// filas de esa fecha aunque hayan llegado en archivos distintos.
 export function convertMovimientoFiles(files, options = {}) {
-  // files: [{ rows, name? }, ...] — mismo formato de `rows` que espera
-  // convertMovimientoRows; `name` es opcional, solo para el aviso de consolidación.
+  // files: [{ rows, name? }, ...]
   const usable = (files || []).filter((f) => f && Array.isArray(f.rows) && f.rows.length > 0);
   if (usable.length === 0) return null;
 
