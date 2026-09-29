@@ -1,139 +1,84 @@
 // ============================================================================
-// CONVERTIDOR: Nómina (formato ancho, un bloque por mes) -> formato largo
+// CONVERTIDOR: Movimiento CC de Siigo -> formato largo de nómina
 // ============================================================================
-// Entrada: las filas de la hoja de la nómina, como array de arrays donde cada
-// celda es { v: valor, f: color de relleno 'RRGGBB' | 'theme:N' | null } (o null
-// si la celda no existe). Lo produce readWorkbookSheetsWithJSZip en App.jsx.
+// Entrada: la hoja del "Movimiento CC" (columnas Comprobante, Fecha elaboración,
+// Descripción, Tercero, Débito, Crédito), como array de arrays (la misma forma
+// que produce parseSheetXmlToRows en App.jsx).
 //
-// Salida: una fila por (mes, empleado, concepto) con las columnas de la Hoja2:
+// Salida: filas con las columnas del ejemplo real (Hoja2 de BUBBLE - Nómina):
 //   Mes elaboración | Concepto | Empleado | Valor Concepto | Valor Totales
-// más una marca interna `_fill` ('RRGGBB' o null) con el color que ya traía
-// la celda en la nómina (el resultado del cruce con Siigo que hace el equipo).
+// más una marca interna `_fill` ('green' = viene de Siigo, 'yellow' = calculado)
+// que se usa solo para colorear la vista previa y el Excel exportado.
 //
-// Cómo se lee la nómina (todas las empresas la arman distinto, así que NO hay
-// columnas fijas):
-//   - Cada bloque empieza con una fila de encabezado que trae un encabezado de
-//     "código de empleado" y uno de "nombre" (ver DEFAULT_CODE_HEADER_ALIASES /
-//     DEFAULT_NAME_HEADER_ALIASES más abajo — RemoFirst usa "EMPLOYEE CODE" /
-//     "NAME"; cada empresa nueva puede traer otra redacción: agrega el alias
-//     ahí en vez de tocar la lógica). Los conceptos son los encabezados de las
-//     columnas que están a la derecha de la columna de nombre.
-//   - El mes se lee de DOS maneras:
-//       1) Si el encabezado trae una columna de mes ("PAYROLL MONTH", "MES
-//          NOMINA", "PERIODO" — es el caso de RemoFirst, con valores en inglés
-//          y sin año: "August", "July"...), el mes sale de esa columna en cada
-//          fila de empleado.
-//       2) Si no, del rótulo de la columna A ("Junio 2026", "MAYO"...).
-//     Si el mes no trae año se deduce por la secuencia de bloques o, si no hay
-//     ninguna referencia, se usa options.defaultYear.
-//   - Se ignoran los subtotales (PAYMENTS, TOTAL...), las columnas en USD, FEE y
-//     tasa de cambio, y las filas de control que Excel repite debajo de cada empleado.
-//   - BANKING TAX (que en RemoFirst está a la derecha de TOTAL EMPLOYEE COST pero
-//     sí forma parte de él) se lee como un concepto más.
-//   - Cada empleado de cada bloque lleva su propio TOTAL EMPLOYEE COST.
-//   - Los valores en cero no se listan. El color de cada valor es el relleno que
-//     tenía la celda en la nómina.
+// Qué se toma de Siigo (solo comprobantes CC-*, las FV/NC de facturación se ignoran):
+//   Salario, Subsidio de transporte, Auxilio extralegal, Vacaciones, Licencia
+//   remunerada, los aportes (pensión, salud, cajas, ARL, SENA, ICBF) y los extra
+//   configurados en EXTRA_PAYROLL_PATTERNS (auxilios, gross up, bonificaciones).
+// Qué se CALCULA (no existe en Siigo, va en amarillo):
+//   13TH SALARY, 14TH SALARY e INTEREST ON 14TH SALARY.
+// Qué se omite a propósito (ya lo cubren las provisiones):
+//   Prima de servicios / prima legal, cesantías e intereses de cesantías.
+// Qué NO se puede generar desde Siigo:
+//   SENA QUOTE u otros conceptos manuales. Lo que no se reconoce queda listado
+//   en las notas para que lo revises; nunca se descarta en silencio.
 
 // --- Configuración editable ---------------------------------------------------
 
-// Colores que el equipo usa para marcar el cruce con Siigo (leyenda de las hojas).
-export const STATUS_COLORS = {
-  '92D050': 'Cruce ok',
-  '00B0F0': 'Cruce ok (azul)',
-  FFFF00: 'No está en el otro lado',
-  FF0000: 'Diferencias',
-  '00FF00': 'Cruza entre meses',
-  '7030A0': 'Débito - Crédito se anulan',
-  '00FFFF': 'Otro (sin leyenda)'
+// Nombre con el que se rotula el "Auxilio Extralegal" de Siigo. En el ejemplo
+// real cambia de un mes a otro (junio usa "Alloawance 2", julio "Alloawance 4"),
+// así que se puede fijar por mes con la clave 'YYYY-MM'.
+export const DEFAULT_ALLOWANCE_NAME = 'Alloawance 4 (Other allowances)';
+export const ALLOWANCE_NAME_BY_MONTH = {
+  '2026-06': 'Alloawance 2 (Mobile & Internet Allowance)'
 };
 
-// Rellenos que son solo formato de la hoja (encabezados, filas de control, USD).
-const STRUCTURAL_FILLS = new Set(['DCFAFA', 'D6E3BC', '1F4763', 'FFFFFF', '000000']);
+// El salario integral ya incluye las prestaciones (prima, cesantías, intereses), así que
+// por defecto NO se calculan 13TH SALARY, 14TH SALARY ni INTEREST ON 14TH SALARY sobre él.
+// Ponlo en true si tu criterio contable es provisionarlos igual.
+export const PROVISIONS_ON_INTEGRAL_SALARY = false;
 
-// Encabezados que NO son un concepto de costo.
-const NON_CONCEPT_EXACT = new Set([
-  'PAYMENTS',
-  'EE RF WID',
-  'ONBOARDING DATE',
-  'OFFBOARDING DATE',
-  'COUNTRY',
-  'PAYROLL MONTH',
-  'SERVICE TYPE / INVOICE TYPE',
-  'ER SS RATE %',
-  'CUSTOMER NAME',
-  'CUSTOMER ID'
+// Cambios manuales de nombre: { 'NOMBRE COMO VIENE EN SIIGO': 'NOMBRE A MOSTRAR' }
+export const NAME_OVERRIDES = {};
+
+// Conceptos extra que SÍ son costo del empleado pero no tienen nombre fijo
+// (auxilios, gross up, bonificaciones...). Se toman de Siigo con su nombre
+// original limpio (sin códigos ni consecutivos) y salen en azul. Para incluir
+// otros (por ejemplo pólizas o seguros de vida) agrega su patrón aquí, sin tildes
+// y en mayúsculas, por ejemplo: /POLIZA|SEGUROS? DE VIDA/
+export const EXTRA_PAYROLL_PATTERNS = [/AUXILIO|GROSS UP|BONIFICACION/];
+
+// Orden en que salen los conceptos dentro de cada mes (igual que la Hoja2):
+// primero los de nómina, luego los extra (alfabético) y al final aportes y provisiones.
+const HEAD_ORDER = [
+  'SALARY',
+  'ANUAL LEAVE',
+  'Paid Leave',
+  'ALLOWANCE', // se reemplaza por el nombre configurado arriba
+  'Transport allowance'
+];
+const TAIL_ORDER = [
+  'PENSION COST',
+  'HEALTH COST',
+  'LABOR RISK COST',
+  'FAMILY FUND COST',
+  'SENA COST',
+  'ICBF COST',
+  '13TH SALARY',
+  '14TH SALARY',
+  'INTEREST ON 14TH SALARY'
+];
+
+// Aportes que Siigo registra a nombre de la entidad (fondo, EPS, caja, SENA...), no del
+// empleado: se asignan al empleado que tenga nómina ese mes.
+const SS_CONCEPTS = new Set([
+  'PENSION COST',
+  'HEALTH COST',
+  'LABOR RISK COST',
+  'FAMILY FUND COST',
+  'SENA COST',
+  'ICBF COST'
 ]);
-
-// Encabezados que identifican la columna de mes en la fila de encabezado del bloque.
-const MONTH_HEADER_ALIASES = ['PAYROLL MONTH', 'MES NOMINA', 'PERIODO'];
-
-// Filas que traen algo en la columna NAME pero no son empleados.
-const NOT_AN_EMPLOYEE = /^(TOTAL|NOMINA|CONTABILIDAD|NOVEDAD|NOVADADES|DIFERENCIA|CRUCE|NO ESTA)/;
-
-// Rótulos del resumen del cruce que hay al final de la hoja (columna A).
-const SUMMARY_LABEL = /^(CRUCE|NO ESTA EN EL OTRO|DIFERENCIAS|CRUZA ENTRE|DEBITO - CREDITO)/;
-
-// Encabezados que identifican la columna de "código de empleado" y la de
-// "nombre" (en mayúsculas y sin tildes, que es como los deja `norm()`).
-// Si al convertir un archivo nuevo el resultado sale vacío, lo primero que hay
-// que revisar es si su encabezado real está en estas listas.
-const DEFAULT_CODE_HEADER_ALIASES = [
-  'EMPLOYEE CODE',
-  'CODIGO',
-  'CODIGO EMPLEADO',
-  'COD EMPLEADO',
-  'ID EMPLEADO',
-  'CEDULA',
-  'DOCUMENTO',
-  'NO. IDENTIFICACION',
-  'IDENTIFICACION'
-];
-const DEFAULT_NAME_HEADER_ALIASES = [
-  'NAME',
-  'NOMBRE',
-  'NOMBRE EMPLEADO',
-  'EMPLEADO',
-  'NOMBRE COMPLETO',
-  'NOMBRE DEL EMPLEADO',
-  'NOMBRES Y APELLIDOS'
-];
-
-const MONTHS = [
-  ['ENERO', 1],
-  ['FEBRERO', 2],
-  ['MARZO', 3],
-  ['ABRIL', 4],
-  ['MAYO', 5],
-  ['JUNIO', 6],
-  ['JULIO', 7],
-  ['AGOSTO', 8],
-  ['SEPTIEMBRE', 9],
-  ['SETIEMBRE', 9],
-  ['OCTUBRE', 10],
-  ['NOVIEMBRE', 11],
-  ['DICIEMBRE', 12]
-];
-
-// Meses en inglés (RemoFirst trae la columna "Payroll Month" así: "August").
-const MONTHS_EN = [
-  ['JANUARY', 1],
-  ['FEBRUARY', 2],
-  ['MARCH', 3],
-  ['APRIL', 4],
-  ['MAY', 5],
-  ['JUNE', 6],
-  ['JULY', 7],
-  ['AUGUST', 8],
-  ['SEPTEMBER', 9],
-  ['OCTOBER', 10],
-  ['NOVEMBER', 11],
-  ['DECEMBER', 12]
-];
-
-// Cuando un empleado no se pudo determinar (p. ej. un aporte patronal sin
-// ningún salario en la misma fecha), se muestra con esta etiqueta en vez de
-// dejar la celda vacía, para que no se pierda de vista en la Hoja2.
-const SIN_EMPLEADO = '(sin asignar)';
+const PAYROLL_BASE_CONCEPTS = ['SALARY', 'ANUAL LEAVE', 'Paid Leave', 'Transport allowance'];
 
 // --- Utilidades ---------------------------------------------------------------
 
@@ -147,10 +92,6 @@ function norm(value) {
     .trim();
 }
 
-function clean(value) {
-  return String(value ?? '').replace(/\s+/g, ' ').trim();
-}
-
 function toNumber(value) {
   if (value === null || value === undefined || value === '') return 0;
   if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
@@ -158,870 +99,479 @@ function toNumber(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
-function round2(n) {
-  return Math.round(n * 100) / 100;
+// Acepta serial de Excel, "dd/mm/yyyy" (texto, como en abril 2026) y "yyyy-mm-dd".
+export function parseSiigoDate(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number') {
+    if (value < 20000 || value > 80000) return null;
+    return new Date(Date.UTC(1899, 11, 30) + Math.floor(value) * 86400000);
+  }
+  const s = String(value).trim();
+  let m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);
+  if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+  m = /^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})/.exec(s);
+  if (m) {
+    let day = +m[1];
+    let month = +m[2];
+    if (month > 12 && day <= 12) [day, month] = [month, day]; // venía como mm/dd
+    return new Date(Date.UTC(+m[3], month - 1, day));
+  }
+  const asNumber = Number(s);
+  if (Number.isFinite(asNumber)) return parseSiigoDate(asNumber);
+  return null;
+}
+
+function monthKeyOf(date) {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
 function formatMoney(n) {
   return Math.round(n).toLocaleString('es-CO');
 }
 
-function cellValue(cell) {
-  return cell ? cell.v : null;
-}
-
-function cellFill(cell) {
-  return cell ? cell.f || null : null;
-}
-
-// "Junio 2026" -> {month: 6, year: 2026}; "MAYO " -> {month: 5, year: null}.
-// Rótulo de la columna A (español).
-function parseMonthLabel(text) {
-  if (typeof text !== 'string') return null;
-  const t = norm(text);
-  if (!t || t.length > 30) return null;
-  for (const [name, num] of MONTHS) {
-    if (t.includes(name)) {
-      const y = /(20\d{2})/.exec(t);
-      return { month: num, year: y ? Number(y[1]) : null };
+// Encuentra la fila de encabezado: debe traer las 5 columnas clave a la vez.
+// (Así se ignoran las hojas auxiliares con tablas dinámicas.)
+export function findSiigoHeader(rows) {
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const cols = {};
+    for (let c = 0; c < row.length; c++) {
+      const h = norm(row[c]);
+      if (!h) continue;
+      if (cols.comprobante === undefined && h === 'COMPROBANTE') cols.comprobante = c;
+      else if (cols.fecha === undefined && h.startsWith('FECHA')) cols.fecha = c;
+      else if (cols.descripcion === undefined && h === 'DESCRIPCION') cols.descripcion = c;
+      else if (cols.tercero === undefined && h === 'TERCERO') cols.tercero = c;
+      else if (cols.debito === undefined && h === 'DEBITO') cols.debito = c;
+      else if (cols.credito === undefined && h === 'CREDITO') cols.credito = c;
+    }
+    if (
+      cols.comprobante !== undefined &&
+      cols.fecha !== undefined &&
+      cols.descripcion !== undefined &&
+      cols.debito !== undefined &&
+      cols.credito !== undefined
+    ) {
+      return { rowIndex: r, cols };
     }
   }
   return null;
 }
 
-// Valor de una celda de la columna de mes ("August", "Julio 2026", "AUG"...).
-// Acepta español e inglés, pero solo por palabra completa (o abreviatura de
-// 3 letras) para no confundir textos como "MAYORGA" con un mes.
-function parseMonthCell(text) {
-  if (typeof text !== 'string') return null;
-  const t = norm(text);
-  if (!t || t.length > 30) return null;
-  const word = t.replace(/[^A-Z]/g, ' ').trim().split(' ')[0];
-  if (!word) return null;
-  const y = /(20\d{2})/.exec(t);
-  for (const [name, num] of [...MONTHS, ...MONTHS_EN]) {
-    if (word === name || word === name.slice(0, 3)) {
-      return { month: num, year: y ? Number(y[1]) : null };
-    }
+// Quita códigos y consecutivos del inicio: "D016-AUXILIO X", "12345 - Auxilio X", "# Auxilio X".
+function stripPrefix(text) {
+  return String(text)
+    .replace(/^\s*\d{4,}\s*-?\s*/, '')
+    .replace(/^\s*[A-Za-z]\d{3}\s*-\s*/, '')
+    .replace(/^\s*#\s*-?\s*/, '')
+    .trim();
+}
+
+function titleCase(text) {
+  return text
+    .toLowerCase()
+    .replace(/(^|[\s(/-])(\p{L})/gu, (m, sep, ch) => sep + ch.toUpperCase());
+}
+
+// Clasifica la descripción de Siigo. Tolera los errores de digitación reales del
+// archivo ("pesiones", "pensione", "ARL" pegado, con/sin tilde).
+function classify(description) {
+  const d = norm(description);
+  // Los aportes de pensión mencionan "cesantías"; se revisan antes que las cesantías.
+  if (/FONDOS? DE PE/.test(d)) return { concept: 'PENSION COST' };
+  if (/PRIMA DE SERVICIOS|PRIMA LEGAL|AJUSTE PRIMA/.test(d)) return { excluded: 'Prima de servicios' };
+  if (/INTERESES (SOBRE )?CESANTIAS/.test(d)) return { excluded: 'Intereses de cesantías' };
+  if (/CONSIGNACION CESANTIAS|(^|[^A-Z])CESANTIAS$/.test(d)) return { excluded: 'Cesantías' };
+  if (/VACACIONES/.test(d)) return { concept: 'ANUAL LEAVE' };
+  if (/LICENCIA REMUNERADA/.test(d)) return { concept: 'Paid Leave' };
+  if (/SUBSIDIO DE TRANSPORTE/.test(d)) return { concept: 'Transport allowance' };
+  if (/AUXILIO EXTRALEGAL/.test(d)) return { concept: 'ALLOWANCE' };
+  if (/SALARIO/.test(d)) return { concept: 'SALARY' };
+  if (/PROMOTORAS DE SALUD|\bEPS\b/.test(d)) return { concept: 'HEALTH COST' };
+  if (/CAJAS? DE COMPENSACION/.test(d)) return { concept: 'FAMILY FUND COST' };
+  if (/RIESGOS LABORALES|\bARL\b/.test(d)) return { concept: 'LABOR RISK COST' };
+
+  const core = norm(stripPrefix(description));
+  if (/^SENA_?$|^APORTES? (AL )?SENA$/.test(core)) return { concept: 'SENA COST' };
+  if (/^(ICBF|IBCF)$|^APORTES? (AL )?ICBF$/.test(core)) return { concept: 'ICBF COST' };
+
+  if (EXTRA_PAYROLL_PATTERNS.some((p) => p.test(d))) {
+    return { extra: titleCase(stripPrefix(description)) };
   }
   return null;
 }
 
-// ¿Esta fila es el encabezado de un bloque? Debe traer una columna de código
-// de empleado y una de nombre (ver codeAliases / nameAliases).
-function readHeader(row, codeAliases, nameAliases) {
-  let codeCol = -1;
-  let nameCol = -1;
-  for (let c = 0; c < row.length; c++) {
-    const t = norm(cellValue(row[c]));
-    if (codeCol < 0 && codeAliases.includes(t)) codeCol = c;
-    else if (nameCol < 0 && nameAliases.includes(t)) nameCol = c;
-  }
-  if (codeCol < 0 || nameCol < 0) return null;
+// Agrupa lo que no se incluye para que el aviso sea corto en vez de una lista de cientos.
+const UNMAPPED_GROUPS = [
+  {
+    label: 'Gastos, legalizaciones y reembolsos (no son costo de nómina)',
+    test: /GASTOS|LEGALIZACION|REEMBOLSO|TIQUETE|CASINO|RESTAURANTE|UBER|TAXI|LICOR|GRAVAMEN|CUOTA DE MANEJO|INTERESES CORRIENTES|COMPRA|EXAMENES|VISA|SIN SOPORTES/
+  },
+  {
+    label: 'Pólizas y seguros (para incluirlos, agrega /POLIZA|SEGUROS? DE VIDA/ en EXTRA_PAYROLL_PATTERNS)',
+    test: /POLIZA|SEGUROS?/
+  },
+  { label: 'Indemnizaciones, liquidaciones y descuentos', test: /INDEMNIZACION|LIQUIDACION|BONUS|DESCUENTO AUTORIZADO/ },
+  { label: 'Reclasificaciones de anticipos', test: /RECLASIFICACION/ }
+];
 
-  // Encabezados a la derecha de NAME.
-  const leaves = [];
-  for (let c = nameCol + 1; c < row.length; c++) {
-    const v = cellValue(row[c]);
-    if (typeof v !== 'string' || !clean(v)) continue;
-    leaves.push({ idx: c, label: clean(v), upper: norm(v) });
-  }
-
-  const tec = leaves.find((l) => l.upper === 'TOTAL EMPLOYEE COST');
-  const payments = leaves.find((l) => l.upper === 'PAYMENTS');
-  const monthLeaf = leaves.find((l) => MONTH_HEADER_ALIASES.includes(l.upper));
-  const limit = tec ? tec.idx : Infinity; // lo que va después (FEE, USD...) no es costo
-
-  let concepts = leaves.filter((l) => {
-    if (l.idx >= limit) return false;
-    if (l.upper.startsWith('TOTAL')) return false; // subtotales
-    if (NON_CONCEPT_EXACT.has(l.upper)) return false;
-    if (l.upper.startsWith('EE STATUS')) return false;
-    if (l.upper.startsWith('FEE') || l.upper.includes('EXCHANGE') || l.upper.includes('USD')) return false;
-    return true;
-  });
-
-  // Algunas nóminas viejas traen SALARY (informativo) junto a INTEGRATED SALARY y
-  // ORDINARY SALARY, que son las que sí suman en PAYMENTS: no se cuenta dos veces.
-  const hasBreakdown = concepts.some((l) => l.upper === 'INTEGRATED SALARY' || l.upper === 'ORDINARY SALARY');
-  if (hasBreakdown) concepts = concepts.filter((l) => l.upper !== 'SALARY');
-
-  // BANKING TAX está a la derecha de TOTAL EMPLOYEE COST (después del límite),
-  // pero el TOTAL EMPLOYEE COST de la hoja SÍ lo incluye: se agrega como concepto.
-  const banking = leaves.find((l) => l.upper === 'BANKING TAX');
-  if (banking && !concepts.includes(banking)) concepts.push(banking);
-
-  if (concepts.length === 0) return null;
-  return {
-    codeCol,
-    nameCol,
-    concepts,
-    tecCol: tec ? tec.idx : null,
-    paymentsCol: payments ? payments.idx : null,
-    monthCol: monthLeaf ? monthLeaf.idx : null
-  };
-}
-
-function statusFill(fill) {
-  if (!fill) return null;
-  return STATUS_COLORS[fill] ? fill : null;
+// "OFIR ELIZABETH ESPAÑA LOPEZ" -> "ESPAÑA LOPEZ OFIR ELIZABETH" (solo nombres de
+// 4 palabras; con otra cantidad es ambiguo y se deja como viene).
+function displayName(rawName, reorder) {
+  if (NAME_OVERRIDES[rawName]) return NAME_OVERRIDES[rawName];
+  if (!reorder || /^(Sin nombre|SIN )/.test(rawName)) return rawName;
+  const t = rawName.split(/\s+/).filter(Boolean);
+  if (t.length === 4) return [t[2], t[3], t[0], t[1]].join(' ');
+  return rawName;
 }
 
 // --- Conversión principal -----------------------------------------------------
 
-export function convertNominaRows(rows, options = {}) {
-  const unifyNames = options.unifyNamesByCode !== false;
-  const defaultYear = options.defaultYear || new Date().getFullYear();
+export function convertSiigoRows(rows, options = {}) {
+  const reorderNames = options.reorderNames !== false;
+  const header = findSiigoHeader(rows);
+  if (!header) return null; // no es un Movimiento CC de Siigo
 
-  // Alias de encabezado: los de por defecto + los que se agreguen por empresa
-  // (options.extraCodeHeaderAliases / extraNameHeaderAliases), o una lista
-  // completa propia si se pasa options.codeHeaderAliases / nameHeaderAliases.
-  const codeAliases = (
-    options.codeHeaderAliases || [...DEFAULT_CODE_HEADER_ALIASES, ...(options.extraCodeHeaderAliases || [])]
-  ).map(norm);
-  const nameAliases = (
-    options.nameHeaderAliases || [...DEFAULT_NAME_HEADER_ALIASES, ...(options.extraNameHeaderAliases || [])]
-  ).map(norm);
-
-  const labelEvents = []; // meses encontrados (rótulos o columna de mes), en orden
-  const monthEventIdx = new Map(); // "año-mes" -> índice en labelEvents (columna de mes)
-  const entries = []; // empleado-bloque
-  const blockInfo = new Map(); // blockId -> { employees: n, checkFill }
-  let header = null;
-  let blockId = 0;
-  let curLabel = -1;
-
-  for (let r = 0; r < rows.length; r++) {
-    const row = rows[r] || [];
-
-    // El resumen del cruce (Cruce ok, Diferencias...) va al final de la hoja: ahí terminan los bloques.
-    if (SUMMARY_LABEL.test(norm(cellValue(row[0])))) {
-      header = null;
-      continue;
-    }
-
-    const label = parseMonthLabel(cellValue(row[0]));
-    if (label) {
-      labelEvents.push({ ...label });
-      curLabel = labelEvents.length - 1;
-    }
-
-    const h = readHeader(row, codeAliases, nameAliases);
-    if (h) {
-      header = h;
-      blockId += 1;
-      blockInfo.set(blockId, { employees: 0, checkFill: null });
-      continue;
-    }
-    if (!header) continue;
-
-    const nameRaw = cellValue(row[header.nameCol]);
-    const name = typeof nameRaw === 'string' ? clean(nameRaw) : '';
-    const code = clean(cellValue(row[header.codeCol]));
-    const hasNumbers = header.concepts.some((c) => typeof cellValue(row[c.idx]) === 'number');
-    const isEmployee = name && !name.startsWith('#') && !/^[\d.,\s-]+$/.test(name) && !NOT_AN_EMPLOYEE.test(norm(name)) && (code || hasNumbers);
-
-    if (!isEmployee) {
-      // Fila de control (sin nombre) con el total del bloque: guarda su color.
-      const info = blockInfo.get(blockId);
-      if (info && header.tecCol !== null && !info.checkFill && typeof cellValue(row[header.tecCol]) === 'number') {
-        info.checkFill = statusFill(cellFill(row[header.tecCol]));
-      }
-      continue;
-    }
-
-    // Si el bloque trae columna de mes (RemoFirst: "Payroll Month"), el mes de
-    // ESTA fila sale de ahí; un mismo bloque puede mezclar meses (ajustes de
-    // julio, abril... dentro de la facturación de agosto).
-    if (header.monthCol !== null) {
-      const p = parseMonthCell(cellValue(row[header.monthCol]));
-      if (p) {
-        const k = `${p.year ?? ''}-${p.month}`;
-        if (!monthEventIdx.has(k)) {
-          labelEvents.push({ ...p });
-          monthEventIdx.set(k, labelEvents.length - 1);
-        }
-        curLabel = monthEventIdx.get(k);
-      }
-    }
-
-    blockInfo.get(blockId).employees += 1;
-    entries.push({ blockId, labelIdx: curLabel, header, rowNum: r + 1, row, code, name });
-  }
-
-  if (entries.length === 0) return null;
-
-  // --- Año de los rótulos sin año -----------------------------------------------
-  // Los bloques van en orden cronológico: un rótulo sin año toma el año del bloque
-  // con año más cercano (hacia atrás si viene antes, hacia adelante si viene después).
-  let refYear = null;
-  let refMonth = null;
-  for (let i = labelEvents.length - 1; i >= 0; i--) {
-    const ev = labelEvents[i];
-    if (ev.year) {
-      refYear = ev.year;
-      refMonth = ev.month;
-    } else if (refYear !== null) {
-      ev.year = ev.month <= refMonth ? refYear : refYear - 1;
-      ev.inferred = true;
-      refYear = ev.year;
-      refMonth = ev.month;
-    }
-  }
-  refYear = null;
-  refMonth = null;
-  for (const ev of labelEvents) {
-    if (ev.year) {
-      refYear = ev.year;
-      refMonth = ev.month;
-    } else if (refYear !== null) {
-      ev.year = ev.month >= refMonth ? refYear : refYear + 1;
-      ev.inferred = true;
-      refYear = ev.year;
-      refMonth = ev.month;
-    }
-  }
-  let noYearAtAll = false;
-  for (const ev of labelEvents) {
-    if (!ev.year) {
-      ev.year = defaultYear;
-      ev.inferred = true;
-      noYearAtAll = true;
-    }
-  }
-
-  // --- Nombre único por código de empleado ---------------------------------------
-  // La misma persona aparece con el nombre en distinto orden según el mes
-  // ("RAMON ESTEBAN CARDONA SALAZAR" / "CARDONA SALAZAR RAMON ESTEBAN"). Se usa el
-  // de su bloque más reciente, que es el formato de la Hoja2.
-  const latestName = new Map();
-  const latestRank = new Map();
-  for (const e of entries) {
-    if (!e.code || e.labelIdx < 0) continue;
-    const ev = labelEvents[e.labelIdx];
-    const rank = ev.year * 12 + ev.month;
-    if (!latestRank.has(e.code) || rank >= latestRank.get(e.code)) {
-      latestRank.set(e.code, rank);
-      latestName.set(e.code, e.name);
-    }
-  }
-
-  // --- Armar las filas largas ------------------------------------------------------
-  const records = [];
+  const { cols } = header;
   const notes = [];
-  const colorCount = new Map();
-  const unknownFills = new Map();
-  let uncolored = 0;
-  let paymentMismatch = 0;
-  let totalMismatch = [];
-  let noLabelRows = 0;
-  let unifiedNames = 0;
-  const months = new Set();
+  const entries = [];
+  const unmapped = new Map(); // descripción -> { total, count, months:Set }
+  const excluded = new Map(); // motivo -> { total, count }
+  const extraNames = new Set();
+  let skippedNoDate = 0;
 
-  for (const e of entries) {
-    const ev = e.labelIdx >= 0 ? labelEvents[e.labelIdx] : null;
-    if (!ev) {
-      noLabelRows += 1;
+  for (let r = header.rowIndex + 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const comprobante = String(row[cols.comprobante] ?? '').trim().toUpperCase();
+    if (!comprobante.startsWith('CC-')) continue; // FV, NC, totales, filas vacías
+
+    const date = parseSiigoDate(row[cols.fecha]);
+    const amount = toNumber(row[cols.debito]) - toNumber(row[cols.credito]);
+    if (amount === 0) continue;
+    if (!date) {
+      skippedNoDate += 1;
       continue;
     }
-    const monthDate = new Date(Date.UTC(ev.year, ev.month - 1, 1));
-    months.add(`${ev.year}-${String(ev.month).padStart(2, '0')}`);
 
-    let shownName = e.name;
-    if (unifyNames && e.code && latestName.get(e.code) && latestName.get(e.code) !== e.name) {
-      shownName = latestName.get(e.code);
-      unifiedNames += 1;
+    const description = String(row[cols.descripcion] ?? '').trim();
+    const tercero = cols.tercero !== undefined ? String(row[cols.tercero] ?? '').trim() : '';
+    const month = monthKeyOf(date);
+    const kind = classify(description);
+
+    if (!kind) {
+      const key = description.replace(/\d{5,}/g, '#');
+      const u = unmapped.get(key) || { total: 0, count: 0, months: new Set() };
+      u.total += amount;
+      u.count += 1;
+      u.months.add(month);
+      unmapped.set(key, u);
+      continue;
+    }
+    if (kind.excluded) {
+      const e = excluded.get(kind.excluded) || { total: 0, count: 0 };
+      e.total += amount;
+      e.count += 1;
+      excluded.set(kind.excluded, e);
+      continue;
     }
 
-    const { concepts, tecCol, paymentsCol } = e.header;
+    const d = norm(description);
+    const concept = kind.extra || kind.concept;
+    if (kind.extra) extraNames.add(kind.extra);
+    entries.push({
+      month,
+      comprobante,
+      concept,
+      amount,
+      tercero,
+      type: kind.extra ? 'extra' : SS_CONCEPTS.has(concept) ? 'ss' : 'core',
+      // Una línea de salario (que no sea retroactivo) abre el bloque de un empleado.
+      isSalaryStart: concept === 'SALARY' && !/RETROACTIV/.test(d),
+      isIntegral: concept === 'SALARY' && /INTEGRAL/.test(d),
+      person: null,
+      block: null,
+      employee: null
+    });
+  }
+
+  // --- Quién es el empleado de cada línea ---------------------------------
+  // 1) Líneas con Tercero de persona: ese es el empleado.
+  // 2) Líneas sin Tercero (Siigo no lo trae en algunos meses): dentro de cada
+  //    comprobante, cada empleado viene en un bloque seguido que empieza en su línea
+  //    de salario. Se separan por bloque para no sumar a varias personas juntas.
+  const namedPersonsByMonth = new Map();
+  const allPersons = new Set();
+  for (const e of entries) {
+    if (e.type !== 'core' || !e.tercero) continue;
+    allPersons.add(e.tercero);
+    if (!namedPersonsByMonth.has(e.month)) namedPersonsByMonth.set(e.month, new Set());
+    namedPersonsByMonth.get(e.month).add(e.tercero);
+  }
+  const fallbackName = allPersons.size === 1 ? [...allPersons][0] : null;
+
+  const blocks = [];
+  let lastComprobante = null;
+  let current = null;
+  for (const e of entries) {
+    if (e.type === 'ss') continue;
+    if (e.comprobante !== lastComprobante) {
+      lastComprobante = e.comprobante;
+      current = null;
+    }
+    const persons = namedPersonsByMonth.get(e.month);
+    const isNamed = e.tercero && (e.type === 'core' || (persons && persons.has(e.tercero)));
+    if (isNamed) {
+      e.person = e.tercero;
+      current = { named: e.tercero };
+      continue;
+    }
+    if (e.isSalaryStart || !current) {
+      current = { month: e.month, salary: e.isSalaryStart ? e.amount : null, name: null, label: null };
+      blocks.push(current);
+    }
+    if (current.named) e.person = current.named;
+    else e.block = current;
+  }
+
+  const blocksByMonth = new Map();
+  for (const b of blocks) {
+    if (!blocksByMonth.has(b.month)) blocksByMonth.set(b.month, []);
+    blocksByMonth.get(b.month).push(b);
+  }
+
+  // ¿El archivo trae varios empleados a la vez? Si nunca los hay (caso de un solo
+  // empleado), todo lo que no trae tercero es de la única persona con nombre.
+  let multiEmployeeFile = false;
+  for (const m of new Set([...blocksByMonth.keys(), ...namedPersonsByMonth.keys()])) {
+    const n = (blocksByMonth.get(m)?.length || 0) + (namedPersonsByMonth.get(m)?.size || 0);
+    if (n > 1) multiEmployeeFile = true;
+  }
+
+  // Si el salario de un bloque sin nombre es idéntico al de una persona con nombre
+  // en otro mes, es evidencia suficiente para darle su nombre.
+  const salaryToPeople = new Map();
+  for (const e of entries) {
+    if (e.type !== 'core' || !e.isSalaryStart || !e.person) continue;
+    if (!salaryToPeople.has(e.amount)) salaryToPeople.set(e.amount, new Set());
+    salaryToPeople.get(e.amount).add(e.person);
+  }
+
+  let unnamedBlocks = 0;
+  for (const [month, list] of blocksByMonth) {
+    const usedNames = new Set(namedPersonsByMonth.get(month) || []);
+    for (const b of list) {
+      if (!multiEmployeeFile) {
+        b.name = fallbackName || 'SIN TERCERO';
+        continue;
+      }
+      const people = b.salary != null ? salaryToPeople.get(b.salary) : null;
+      if (people && people.size === 1 && !usedNames.has([...people][0])) {
+        b.name = [...people][0];
+        usedNames.add(b.name);
+      } else {
+        b.label = b.salary != null ? `Sin nombre - salario ${formatMoney(b.salary)}` : 'Sin nombre - sin salario';
+      }
+    }
+    // Etiquetas repetidas en el mismo mes (dos personas con el mismo salario): numerarlas.
+    const counts = new Map();
+    list.forEach((b) => b.label && counts.set(b.label, (counts.get(b.label) || 0) + 1));
+    const seen = new Map();
+    for (const b of list) {
+      if (!b.label) continue;
+      unnamedBlocks += 1;
+      if (counts.get(b.label) > 1) {
+        const n = (seen.get(b.label) || 0) + 1;
+        seen.set(b.label, n);
+        b.name = `${b.label} (#${n})`;
+      } else {
+        b.name = b.label;
+      }
+    }
+  }
+
+  const employeesByMonth = new Map(); // mes -> Set(empleados con nómina ese mes)
+  for (const e of entries) {
+    if (e.type === 'ss') continue;
+    e.employee = e.person || e.block.name;
+    if (!employeesByMonth.has(e.month)) employeesByMonth.set(e.month, new Set());
+    employeesByMonth.get(e.month).add(e.employee);
+  }
+
+  // 3) Aportes (pensión, salud, cajas, ARL, SENA, ICBF): Siigo los registra a nombre
+  //    del fondo, no de la persona. Con un solo empleado ese mes se le asignan; con
+  //    varios no se pueden repartir desde Siigo y quedan aparte.
+  const ambiguousMonths = new Set();
+  for (const e of entries) {
+    if (e.type !== 'ss') continue;
+    const set = employeesByMonth.get(e.month);
+    if (set && set.size === 1) e.employee = [...set][0];
+    else if (set && set.size > 1) {
+      e.employee = 'SIN ASIGNAR (aportes)';
+      ambiguousMonths.add(e.month);
+    } else e.employee = fallbackName || 'SIN TERCERO';
+  }
+
+  // --- Agrupar por mes y empleado ---------------------------------------------
+  const buckets = new Map(); // `${mes}|${empleado}` -> Map(concepto -> valor)
+  const integralByKey = new Map();
+  for (const e of entries) {
+    const key = `${e.month}|${e.employee}`;
+    if (!buckets.has(key)) buckets.set(key, new Map());
+    const m = buckets.get(key);
+    m.set(e.concept, (m.get(e.concept) || 0) + e.amount);
+    if (e.isIntegral) integralByKey.set(key, (integralByKey.get(key) || 0) + e.amount);
+  }
+
+  // Primer mes con datos de cada empleado en cada año (para el interés acumulado).
+  const firstMonthOfYear = new Map(); // `${empleado}|${año}` -> número de mes mínimo
+  for (const key of buckets.keys()) {
+    const [month, employee] = key.split('|');
+    const [year, mm] = month.split('-').map(Number);
+    const k = `${employee}|${year}`;
+    if (!firstMonthOfYear.has(k) || mm < firstMonthOfYear.get(k)) firstMonthOfYear.set(k, mm);
+  }
+
+  const extraSorted = [...extraNames].sort((a, b) => a.localeCompare(b, 'es'));
+  const conceptOrder = [...HEAD_ORDER, ...extraSorted, ...TAIL_ORDER];
+  const provisionKeys = new Set(['13TH SALARY', '14TH SALARY', 'INTEREST ON 14TH SALARY']);
+  let integralWithoutProvisions = false;
+
+  const records = [];
+  const sortedKeys = [...buckets.keys()].sort();
+  for (const key of sortedKeys) {
+    const [month, employee] = key.split('|');
+    const [year, mm] = month.split('-').map(Number);
+    const concepts = new Map(buckets.get(key));
+    const monthDate = new Date(Date.UTC(year, mm - 1, 1));
+    const shownName = displayName(employee, reorderNames);
+
+    // Provisiones (calculadas). Base = salario + transporte + vacaciones + licencia;
+    // el auxilio extralegal no salarial y los extra no entran. El salario integral
+    // tampoco entra (ya incluye las prestaciones), salvo que se configure lo contrario.
+    const integral = integralByKey.get(key) || 0;
+    let base = PAYROLL_BASE_CONCEPTS.reduce((s, c) => s + (concepts.get(c) || 0), 0);
+    if (!PROVISIONS_ON_INTEGRAL_SALARY) {
+      base -= integral;
+      if (integral > 0) integralWithoutProvisions = true;
+    }
+    // Sin salario ordinario ese mes (p. ej. solo vacaciones de una liquidación) no hay provisión.
+    const hasOrdinarySalary = (concepts.get('SALARY') || 0) - (PROVISIONS_ON_INTEGRAL_SALARY ? 0 : integral) > 0;
+    if (base > 0 && hasOrdinarySalary) {
+      const monthly = Math.round(base / 12);
+      const monthsSinceStart = mm - firstMonthOfYear.get(`${employee}|${year}`) + 1;
+      concepts.set('13TH SALARY', monthly);
+      concepts.set('14TH SALARY', monthly);
+      concepts.set('INTEREST ON 14TH SALARY', Math.round((monthly * (2 * monthsSinceStart - 1)) / 100));
+    }
+
     let total = 0;
-    let payrollSum = 0;
-    const rowsOut = [];
-    for (const c of concepts) {
-      const cell = e.row[c.idx];
-      const value = toNumber(cellValue(cell));
-      if (paymentsCol !== null && c.idx < paymentsCol) payrollSum += value;
-      if (value === 0) continue;
+    for (const concept of conceptOrder) {
+      const value = concepts.get(concept);
+      if (!value) continue;
       total += value;
-      const rawFill = cellFill(cell);
-      let fill = statusFill(rawFill);
-      if (!fill && rawFill && /^[0-9A-F]{6}$/.test(rawFill) && !STRUCTURAL_FILLS.has(rawFill)) {
-        unknownFills.set(rawFill, (unknownFills.get(rawFill) || 0) + 1);
-      }
-      rowsOut.push({ label: c.label, value, fill });
-    }
-
-    // Comprobaciones contra los totales que trae la propia nómina.
-    if (paymentsCol !== null) {
-      const paid = toNumber(cellValue(e.row[paymentsCol]));
-      if (Math.abs(paid - payrollSum) > 1) paymentMismatch += 1;
-    }
-    total = round2(total);
-    if (tecCol !== null) {
-      const sheetTotal = toNumber(cellValue(e.row[tecCol]));
-      if (sheetTotal !== 0 && Math.abs(sheetTotal - total) > 1) {
-        totalMismatch.push({ month: `${ev.year}-${String(ev.month).padStart(2, '0')}`, name: shownName, diff: total - sheetTotal });
-      }
-    }
-
-    for (const o of rowsOut) {
+      const label =
+        concept === 'ALLOWANCE'
+          ? ALLOWANCE_NAME_BY_MONTH[month] || DEFAULT_ALLOWANCE_NAME
+          : concept;
+      let fill = 'green';
+      if (provisionKeys.has(concept)) fill = 'yellow';
+      else if (extraNames.has(concept)) fill = 'blue';
       records.push({
         'Mes elaboración': monthDate,
-        Concepto: o.label,
+        Concepto: label,
         Empleado: shownName,
-        'Valor Concepto': o.value,
+        'Valor Concepto': value,
         'Valor Totales': 0,
-        _fill: o.fill
+        _fill: fill
       });
-      if (o.fill) colorCount.set(o.fill, (colorCount.get(o.fill) || 0) + 1);
-      else uncolored += 1;
     }
-
     if (total !== 0) {
-      // El color del total: el de su propia celda o, si el bloque tiene un solo
-      // empleado, el de la fila de control (ahí es donde el equipo lo pinta).
-      let totalFill = tecCol !== null ? statusFill(cellFill(e.row[tecCol])) : null;
-      const info = blockInfo.get(e.blockId);
-      if (!totalFill && info && info.employees === 1) totalFill = info.checkFill;
       records.push({
         'Mes elaboración': monthDate,
         Concepto: 'TOTAL EMPLOYEE COST',
         Empleado: shownName,
         'Valor Concepto': 0,
         'Valor Totales': total,
-        _fill: totalFill
+        _fill: 'green'
       });
-      if (totalFill) colorCount.set(totalFill, (colorCount.get(totalFill) || 0) + 1);
-      else uncolored += 1;
     }
   }
 
-  // --- Avisos ---------------------------------------------------------------------
-  const sortedMonths = [...months].sort();
-  notes.push({
-    type: 'info',
-    text: `Se leyeron ${entries.length} empleado(s)-mes de ${sortedMonths.length} mes(es)${
-      sortedMonths.length ? ` (${sortedMonths[0]} a ${sortedMonths[sortedMonths.length - 1]})` : ''
-    }.`
-  });
-  if (colorCount.size > 0 || uncolored > 0) {
-    const parts = [...colorCount.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .map(([hex, n]) => `${STATUS_COLORS[hex]}: ${n}`);
+  // --- Notas para el usuario (cortas: lo no incluido va agrupado por tipo) ------
+  if (records.length > 0) {
     notes.push({
       type: 'info',
-      text: `Colores tomados de la nómina — ${parts.length ? parts.join(', ') : 'ninguno'}${
-        uncolored > 0 ? `; sin color (la celda no estaba pintada en la nómina): ${uncolored}` : ''
-      }.`
+      text: '13TH SALARY, 14TH SALARY e INTEREST ON 14TH SALARY no existen en Siigo: se calculan (amarillo). Revísalos contra tu criterio.'
     });
   }
-  if (unifiedNames > 0) {
+  if (integralWithoutProvisions) {
     notes.push({
       type: 'info',
-      text: `Se unificó el nombre en ${unifiedNames} fila(s) usando el nombre más reciente de cada código de empleado (en la nómina el orden de nombre y apellido cambia de un mes a otro).`
+      text: 'Salario integral: no se calculan 13TH/14TH/interés sobre él porque el integral ya incluye las prestaciones. Para calcularlos igual, pon PROVISIONS_ON_INTEGRAL_SALARY = true en siigoConverter.js.'
     });
   }
-  if (labelEvents.some((ev) => ev.inferred)) {
-    notes.push({
-      type: noYearAtAll ? 'warn' : 'info',
-      text: noYearAtAll
-        ? `Ningún rótulo de mes trae el año; se usó ${defaultYear}. Revisa la columna Mes elaboración.`
-        : 'Algunos rótulos de mes no traen el año (p. ej. "MAYO"); se dedujo por el orden de los bloques.'
-    });
-  }
-  if (paymentMismatch > 0) {
+  if (unnamedBlocks > 0) {
     notes.push({
       type: 'warn',
-      text: `${paymentMismatch} fila(s) donde los conceptos de nómina no suman el PAYMENTS de la hoja: revisa que no falte o sobre una columna en ese bloque.`
+      text: `En varios meses Siigo no trae el nombre del empleado (Tercero vacío) y hay más de uno a la vez: se separaron por bloque de salario y salen como "Sin nombre - salario X". Ponles nombre en el panel "Empleados sin nombre" (abajo, junto al resultado).`
     });
   }
-  if (totalMismatch.length > 0) {
-    const ex = totalMismatch
-      .slice(0, 4)
-      .map((m) => `${m.month} ${m.name} (${m.diff > 0 ? '+' : ''}${formatMoney(m.diff)})`)
-      .join('; ');
+  if (extraNames.size > 0) {
     notes.push({
-      type: 'warn',
-      text: `${totalMismatch.length} fila(s) donde el TOTAL EMPLOYEE COST calculado no coincide con el de la hoja. Ejemplos: ${ex}.`
+      type: 'info',
+      text: `Conceptos tomados de Siigo con su nombre original (azul): ${extraSorted.join(', ')}.`
     });
   }
-  if (unknownFills.size > 0) {
-    const list = [...unknownFills.entries()].map(([hex, n]) => `#${hex} (${n})`).join(', ');
+  for (const [reason, e] of excluded) {
     notes.push({
-      type: 'warn',
-      text: `Colores de la nómina que no están en la leyenda del cruce y se dejaron sin color: ${list}.`
-    });
-  }
-  if (noLabelRows > 0) {
-    notes.push({
-      type: 'warn',
-      text: `${noLabelRows} empleado(s) aparecen antes de cualquier rótulo de mes y se omitieron.`
+      type: 'info',
+      text: `Se omitieron ${e.count} línea(s) de "${reason}" (${formatMoney(e.total)}): ya las cubren las provisiones.`
     });
   }
 
-  return { records, notes };
-}
-
-// --- Consolidar varias nóminas (varios archivos del mismo mes o de varios
-// meses) en un solo resultado ---------------------------------------------------
-// RemoFirst, por ejemplo, no entrega un único archivo general por mes sino
-// 4, 5 o 6 archivos distintos según el mes. Esta función junta las filas de
-// todos los archivos de una misma empresa (en el orden en que los subas —
-// idealmente cronológico) y llama a convertNominaRows una sola vez sobre el
-// conjunto completo, para que el resultado quede consolidado en un solo
-// archivo en vez de uno por archivo de entrada.
-//
-// Uso desde App.jsx: en vez de llamar convertNominaRows por cada hoja leída,
-// junta las hojas de una misma empresa en `files` y llama a esta función una
-// sola vez; el resultado (records + notes) es el que se exporta a Excel.
-export function convertNominaFiles(files, options = {}) {
-  // files: [{ rows, name? }, ...] — `rows` es el mismo array de arrays que
-  // recibe convertNominaRows; `name` es opcional, solo para los avisos.
-  const usable = (files || []).filter((f) => f && Array.isArray(f.rows) && f.rows.length > 0);
-  if (usable.length === 0) return null;
-
-  const allRows = [];
-  for (const f of usable) {
-    allRows.push(...f.rows);
-  }
-
-  const result = convertNominaRows(allRows, options);
-  if (!result) return null;
-
-  const names = usable.map((f, i) => f.name || `archivo ${i + 1}`).join(', ');
-  result.notes.unshift({
-    type: 'info',
-    text: `Se consolidaron ${usable.length} archivo(s) de entrada en un solo resultado (${names}).`
-  });
-  return result;
-}
-
-// ============================================================================
-// CONVERTIDOR: Movimiento CC (extracto contable de Siigo) -> resumen tipo nómina
-// ============================================================================
-// Entrada: la hoja del movimiento de cuenta contable, con las columnas típicas
-// de Siigo: Comprobante | Fecha elaboración | Descripción | Tercero | Débito |
-// Crédito | Saldo Movimiento (el orden de columnas puede variar entre
-// empresas; se detectan por el nombre del encabezado, no por posición fija).
-//
-// Reproduce el mismo resumen "tipo nómina" que se arma a mano en Excel con
-// Tabla dinámica / SUMIFS:
-//
-//   1. Cada Descripción se clasifica a un concepto tipo nómina (SALARY,
-//      Transport allowance, PENSION COST, HEALTH COST...) usando la tabla
-//      CONCEPT_KEYWORDS de abajo — el equivalente en código a la hoja
-//      "Mapeo" del Excel. Es la primera palabra clave que aparece como
-//      substring de la Descripción (sin tildes ni mayúsculas/minúsculas).
-//      Si no coincide con ninguna, el concepto queda tal cual venía en
-//      Descripción y se marca como "sin clasificar" en los avisos.
-//
-//   2. Empleado: en las filas de salario/prestaciones (grupo 'empleado')
-//      Tercero normalmente YA es el nombre del empleado. Cuando viene vacío,
-//      y en los aportes patronales (grupo 'aporte', donde Tercero es la
-//      entidad), el empleado se infiere: se busca, en la MISMA fecha de
-//      elaboración, qué empleado aparece en alguna fila del grupo 'empleado'
-//      que sí trajo Tercero. Si hay un solo candidato se le asigna; si hay
-//      varios o ninguno, la fila queda "(sin asignar)" en vez de adivinar.
-//
-//   3. Las filas de ingreso/facturación al cliente (grupo 'excluir') no son
-//      costo de un empleado, así que no entran al resumen.
-//
-//   4. Se agrupa por (Mes, Concepto, Empleado) sumando "Valor Concepto"
-//      (Débito - Crédito) y se agrega una fila TOTAL EMPLOYEE COST por
-//      (Mes, Empleado).
-//
-//   5. Las filas de salida quedan ordenadas por Mes, luego Empleado y, dentro
-//      de cada mes-empleado, en el orden en que los conceptos aparecieron en
-//      el extracto, con TOTAL EMPLOYEE COST al final del bloque.
-//
-//   6. Cuando se juntan varios archivos de Movimiento CC (ver
-//      convertMovimientoFiles), cada archivo trae su propio resumen del cruce
-//      al final; al llegar a él la lectura no se detiene, solo cierra el
-//      bloque actual y sigue buscando el encabezado del siguiente archivo.
-//
-// Devuelve las mismas columnas de siempre (Mes elaboración | Concepto |
-// Empleado | Valor Concepto | Valor Totales), así que App.jsx no necesita cambios.
-
-// Tabla de clasificación — el equivalente en código a la hoja "Mapeo" del Excel.
-//
-//   group: 'empleado' -> Tercero, cuando viene diligenciado, ya es el nombre
-//                        del empleado; si viene vacío se infiere por fecha.
-//   group: 'aporte'   -> Tercero es la entidad; el empleado se infiere por fecha.
-//   group: 'excluir'  -> no es costo de nómina, se descarta (ingresos/facturación).
-export const CONCEPT_KEYWORDS = [
-  { keyword: 'EO THIRD PARTIES', concepto: null, group: 'excluir' },
-  { keyword: 'INGRESOS RECIBIDOS', concepto: null, group: 'excluir' },
-
-  { keyword: '001050 - SALARIO', concepto: 'SALARY', group: 'empleado' },
-  { keyword: 'SUBSIDIO DE TRANSPORTE', concepto: 'Transport allowance', group: 'empleado' },
-  { keyword: 'AUXILIO EXTRALEGAL', concepto: 'Allowance (No salarial)', group: 'empleado' },
-  { keyword: 'DIAS HABILES EN VACACIONES', concepto: 'Vacation (días hábiles)', group: 'empleado' },
-  { keyword: 'DIAS NO HABILES EN VACACIONES', concepto: 'Vacation (días no hábiles)', group: 'empleado' },
-  { keyword: 'LICENCIA REMUNERADA', concepto: 'Paid leave', group: 'empleado' },
-  { keyword: 'PRIMA DE SERVICIOS', concepto: '13TH SALARY', group: 'empleado' },
-  { keyword: 'INTERESES CESANTIAS', concepto: 'INTEREST ON 14TH SALARY', group: 'empleado' },
-  { keyword: 'CONSIGNACION CESANTIAS', concepto: '14TH SALARY', group: 'empleado' },
-  { keyword: 'FPP', concepto: 'Other (People Pass / dotación)', group: 'empleado' },
-
-  { keyword: 'APORTES A FONDOS DE', concepto: 'PENSION COST', group: 'aporte' },
-  { keyword: 'APORTES A ENTIDADES PROMOTORAS DE SALUD', concepto: 'HEALTH COST', group: 'aporte' },
-  { keyword: 'APORTES A CAJAS DE COMPENSACION', concepto: 'FAMILY FUND COST', group: 'aporte' },
-  { keyword: 'APORTES A ADMINISTRADORAS DE RIESGOS', concepto: 'LABOR RISK COST', group: 'aporte' }
-];
-
-const MOVIMIENTO_REQUIRED_HEADERS = ['COMPROBANTE', 'FECHA ELABORACION', 'DESCRIPCION', 'DEBITO', 'CREDITO'];
-
-const MOVIMIENTO_STOP_LABEL = /^(CRUCE OK|NO ESTA EN EL OTRO LADO|DIFERENCIAS|CRUZA ENTRE MESES|CRUZA ENTRE ANO|DEBITO - CREDITO SE ANULAN)/;
-
-// Excel guarda las fechas como número de serie (días desde 1899-12-30). El
-// lector de App.jsx no las convierte a Date (solo lee el valor crudo de la
-// celda), así que se decodifican aquí antes de usarlas. También hay filas
-// con la fecha como texto "dd/mm/aaaa" (capturadas a mano) — se parsean sin
-// depender del locale del navegador.
-function dateFromExcelSerial(value) {
-  if (value instanceof Date) return value;
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    const ms = Date.UTC(1899, 11, 30) + Math.round(value) * 86400000;
-    return new Date(ms);
-  }
-  if (typeof value === 'string' && value.trim()) {
-    const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(value.trim());
-    if (m) {
-      const day = Number(m[1]);
-      const month = Number(m[2]);
-      const year = Number(m[3]);
-      const d = new Date(Date.UTC(year, month - 1, day));
-      if (!Number.isNaN(d.getTime())) return d;
-    }
-    const parsed = new Date(value);
-    if (!Number.isNaN(parsed.getTime())) return parsed;
-  }
-  return null;
-}
-
-function firstOfMonth(date) {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
-}
-
-function monthKey(date) {
-  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
-}
-
-function dateKey(date) {
-  return date.toISOString().slice(0, 10);
-}
-
-// Busca la fila de encabezado (Comprobante / Fecha elaboración / Descripción /
-// Débito / Crédito), sin asumir en qué columna queda cada una.
-function readMovimientoHeader(row) {
-  const map = {};
-  for (let c = 0; c < row.length; c++) {
-    const t = norm(cellValue(row[c]));
-    if (t && map[t] === undefined) map[t] = c;
-  }
-  for (const required of MOVIMIENTO_REQUIRED_HEADERS) {
-    if (map[required] === undefined) return null;
-  }
-  return {
-    comprobanteCol: map['COMPROBANTE'],
-    fechaCol: map['FECHA ELABORACION'],
-    descripcionCol: map['DESCRIPCION'],
-    terceroCol: map['TERCERO'] !== undefined ? map['TERCERO'] : null,
-    debitoCol: map['DEBITO'],
-    creditoCol: map['CREDITO']
-  };
-}
-
-export function convertMovimientoRows(rows, options = {}) {
-  const conceptKeywords = options.conceptKeywords || CONCEPT_KEYWORDS;
-  const matchConceptWith = (descripcionNorm) => {
-    for (const entry of conceptKeywords) {
-      if (descripcionNorm.includes(norm(entry.keyword))) return entry;
-    }
-    return null;
-  };
-
-  let header = null;
-  let started = false;
-
-  // --- Pasada 1: leer cada movimiento y clasificarlo -----------------------------
-  const parsedRows = [];
-  const employeesByDate = new Map(); // dateKey -> Set(nombre de empleado)
-  const unknownFills = new Map();
-  let excludedRows = 0;
-  let skippedNoDate = 0;
-  let dataRows = 0;
-  let unclassifiedCount = 0;
-  const unclassifiedExamples = new Map();
-
-  for (let r = 0; r < rows.length; r++) {
-    const row = rows[r] || [];
-
-    if (!started) {
-      const h = readMovimientoHeader(row);
-      if (h) {
-        header = h;
-        started = true;
-      }
-      continue;
-    }
-
-    if (readMovimientoHeader(row)) continue; // encabezado repetido (varias hojas/archivos pegados)
-
-    const comprobanteVal = clean(cellValue(row[header.comprobanteCol]));
-    const descripcionVal = clean(cellValue(row[header.descripcionCol]));
-
-    if (!comprobanteVal && MOVIMIENTO_STOP_LABEL.test(norm(descripcionVal))) {
-      // Resumen del cruce al final de ESTE archivo. No se corta la lectura
-      // por completo: se cierra el bloque actual y se vuelve a buscar un
-      // encabezado válido (las filas siguientes serían del siguiente archivo).
-      started = false;
-      header = null;
-      continue;
-    }
-    if (!comprobanteVal && !descripcionVal) continue; // fila en blanco
-
-    const fecha = dateFromExcelSerial(cellValue(row[header.fechaCol]));
-    if (!fecha) {
-      skippedNoDate += 1;
-      continue;
-    }
-    const monthDate = firstOfMonth(fecha);
-    const dKey = dateKey(fecha);
-
-    const terceroVal = header.terceroCol !== null ? clean(cellValue(row[header.terceroCol])) : '';
-    const debitoCell = row[header.debitoCol];
-    const creditoCell = row[header.creditoCol];
-    const debito = toNumber(cellValue(debitoCell));
-    const credito = toNumber(cellValue(creditoCell));
-    const value = round2(debito - credito);
-    if (value === 0) continue;
-
-    const descripcionNorm = norm(descripcionVal);
-    const match = matchConceptWith(descripcionNorm);
-
-    if (match && match.group === 'excluir') {
-      excludedRows += 1;
-      continue;
-    }
-
-    const group = match ? match.group : 'otro';
-    const concepto = match ? match.concepto : descripcionVal;
-    if (!match) {
-      unclassifiedCount += 1;
-      unclassifiedExamples.set(descripcionVal, (unclassifiedExamples.get(descripcionVal) || 0) + 1);
-    }
-
-    if (group === 'empleado' && terceroVal) {
-      if (!employeesByDate.has(dKey)) employeesByDate.set(dKey, new Set());
-      employeesByDate.get(dKey).add(terceroVal);
-    }
-
-    const rawFill = cellFill(debito !== 0 ? debitoCell : creditoCell) || cellFill(debitoCell) || cellFill(creditoCell);
-    const fill = statusFill(rawFill);
-    if (!fill && rawFill && /^[0-9A-F]{6}$/.test(rawFill) && !STRUCTURAL_FILLS.has(rawFill)) {
-      unknownFills.set(rawFill, (unknownFills.get(rawFill) || 0) + 1);
-    }
-
-    dataRows += 1;
-    parsedRows.push({ monthDate, dKey, comprobante: comprobanteVal, concepto, group, tercero: terceroVal, value, fill });
-  }
-
-  // (no se exige `header`: al llegar al resumen del cruce se reinicia a null)
-  if (dataRows === 0) return null;
-
-  // --- Pasada 2: resolver el empleado ---------------------------------------------
-  let ambiguousSinTercero = 0;
-  let unresolvedSinTercero = 0;
-  for (const pr of parsedRows) {
-    if (pr.group === 'empleado' && pr.tercero) {
-      pr.empleado = pr.tercero;
-      continue;
-    }
-    const candidates = employeesByDate.get(pr.dKey);
-    if (candidates && candidates.size === 1) {
-      pr.empleado = [...candidates][0];
-    } else if (candidates && candidates.size > 1) {
-      pr.empleado = '';
-      ambiguousSinTercero += 1;
+  const groupTotals = new Map(); // etiqueta -> { total, count }
+  const otherLines = [];
+  for (const [desc, u] of unmapped) {
+    const d = norm(desc);
+    const group = UNMAPPED_GROUPS.find((g) => g.test.test(d));
+    if (group) {
+      const g = groupTotals.get(group.label) || { total: 0, count: 0 };
+      g.total += u.total;
+      g.count += u.count;
+      groupTotals.set(group.label, g);
     } else {
-      pr.empleado = '';
-      unresolvedSinTercero += 1;
+      otherLines.push({ desc, ...u });
     }
   }
-
-  // --- Agrupar por Mes + Concepto + Empleado (equivalente a SUMIFS) --------------
-  const grouped = new Map(); // key -> { monthDate, concepto, empleado, value, fill }
-  const totalsByMonthEmployee = new Map(); // "mes|empleado" -> total
-  const colorCount = new Map();
-  let uncolored = 0;
-  const months = new Set();
-
-  for (const pr of parsedRows) {
-    months.add(monthKey(pr.monthDate));
-    const key = `${monthKey(pr.monthDate)}|${pr.concepto}|${pr.empleado}`;
-    if (!grouped.has(key)) {
-      grouped.set(key, { monthDate: pr.monthDate, concepto: pr.concepto, empleado: pr.empleado, value: 0, fill: pr.fill });
-    }
-    const g = grouped.get(key);
-    g.value = round2(g.value + pr.value);
-    if (!g.fill && pr.fill) g.fill = pr.fill; // conserva el primer color no nulo del grupo
-
-    if (pr.empleado) {
-      const teKey = `${monthKey(pr.monthDate)}|${pr.empleado}`;
-      totalsByMonthEmployee.set(teKey, round2((totalsByMonthEmployee.get(teKey) || 0) + pr.value));
-    }
-  }
-
-  const records = [];
-  for (const g of grouped.values()) {
-    if (g.value === 0) continue;
-    records.push({
-      'Mes elaboración': g.monthDate,
-      Concepto: g.concepto,
-      Empleado: g.empleado || SIN_EMPLEADO,
-      'Valor Concepto': g.value,
-      'Valor Totales': 0,
-      _fill: g.fill
-    });
-    if (g.fill) colorCount.set(g.fill, (colorCount.get(g.fill) || 0) + 1);
-    else uncolored += 1;
-  }
-
-  for (const [key, total] of totalsByMonthEmployee) {
-    if (total === 0) continue;
-    const [mKey, empleado] = key.split('|');
-    const [y, m] = mKey.split('-').map(Number);
-    records.push({
-      'Mes elaboración': new Date(Date.UTC(y, m - 1, 1)),
-      Concepto: 'TOTAL EMPLOYEE COST',
-      Empleado: empleado || SIN_EMPLEADO,
-      'Valor Concepto': 0,
-      'Valor Totales': total,
-      _fill: null
-    });
-  }
-
-  // --- Orden de salida -------------------------------------------------------------
-  // Mes -> Empleado -> conceptos en el orden en que aparecieron en el extracto,
-  // con TOTAL EMPLOYEE COST al final de cada bloque mes-empleado.
-  const firstSeen = new Map(); // "mes|empleado|concepto" -> índice de aparición
-  parsedRows.forEach((pr, idx) => {
-    const key = `${monthKey(pr.monthDate)}|${pr.empleado || SIN_EMPLEADO}|${pr.concepto}`;
-    if (!firstSeen.has(key)) firstSeen.set(key, idx);
-  });
-
-  const sortKey = (rec) => {
-    const d = rec['Mes elaboración'];
-    const monthNum = d.getUTCFullYear() * 12 + d.getUTCMonth();
-    const isTotal = rec.Concepto === 'TOTAL EMPLOYEE COST' ? 1 : 0;
-    const orderKey = `${monthKey(d)}|${rec.Empleado}|${rec.Concepto}`;
-    const order = firstSeen.has(orderKey) ? firstSeen.get(orderKey) : Number.MAX_SAFE_INTEGER;
-    return [monthNum, rec.Empleado, isTotal, order];
-  };
-
-  records.sort((a, b) => {
-    const ka = sortKey(a);
-    const kb = sortKey(b);
-    for (let i = 0; i < ka.length; i++) {
-      if (ka[i] < kb[i]) return -1;
-      if (ka[i] > kb[i]) return 1;
-    }
-    return 0;
-  });
-
-  // --- Avisos ---------------------------------------------------------------------
-  const notes = [];
-  const sortedMonths = [...months].sort();
-  notes.push({
-    type: 'info',
-    text: `Se leyeron ${dataRows} movimiento(s) en ${sortedMonths.length} mes(es)${
-      sortedMonths.length ? ` (${sortedMonths[0]} a ${sortedMonths[sortedMonths.length - 1]})` : ''
-    } y se agruparon en ${grouped.size} fila(s) de concepto + ${totalsByMonthEmployee.size} de TOTAL EMPLOYEE COST.`
-  });
-  if (excludedRows > 0) {
-    notes.push({
-      type: 'info',
-      text: `${excludedRows} movimiento(s) de facturación/ingresos (p. ej. "EO Third parties service...") se excluyeron por no ser costo de un empleado.`
-    });
-  }
-  if (colorCount.size > 0 || uncolored > 0) {
-    const parts = [...colorCount.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .map(([hex, n]) => `${STATUS_COLORS[hex]}: ${n}`);
-    notes.push({
-      type: 'info',
-      text: `Colores tomados del movimiento — ${parts.length ? parts.join(', ') : 'ninguno'}${
-        uncolored > 0 ? `; sin color: ${uncolored}` : ''
-      }.`
-    });
-  }
-  if (unresolvedSinTercero > 0) {
+  for (const [label, g] of groupTotals) {
     notes.push({
       type: 'warn',
-      text: `${unresolvedSinTercero} fila(s) sin Tercero (aporte patronal, o salario/prestación que vino sin Tercero en el Movimiento CC) no se pudieron asignar a ningún empleado porque no hay ninguna fila con Tercero diligenciado en esa misma fecha; quedaron marcadas como "${SIN_EMPLEADO}".`
+      text: `No incluido — ${label}: ${g.count} línea(s), ${formatMoney(g.total)}.`
     });
   }
-  if (ambiguousSinTercero > 0) {
+  otherLines.sort((a, b) => Math.abs(b.total) - Math.abs(a.total));
+  for (const o of otherLines.slice(0, 8)) {
     notes.push({
       type: 'warn',
-      text: `${ambiguousSinTercero} fila(s) sin Tercero quedaron marcadas como "${SIN_EMPLEADO}" porque ese día hay más de un empleado candidato (empresa con varios empleados pagados la misma fecha) — revísalas a mano.`
+      text: `Sin mapear: "${o.desc.slice(0, 70)}" — ${o.count} línea(s), ${formatMoney(o.total)}. No está en el resultado.`
     });
   }
-  if (unclassifiedCount > 0) {
-    const ex = [...unclassifiedExamples.entries()]
-      .slice(0, 5)
-      .map(([desc, n]) => `"${desc}" (${n})`)
-      .join('; ');
+  if (otherLines.length > 8) {
+    const rest = otherLines.slice(8);
     notes.push({
       type: 'warn',
-      text: `${unclassifiedCount} movimiento(s) no coincidieron con ninguna palabra clave de CONCEPT_KEYWORDS y quedaron con el texto tal cual de Descripción: ${ex}. Agrégalos a CONCEPT_KEYWORDS si deben salir con el nombre tipo nómina.`
+      text: `Sin mapear: otros ${rest.length} conceptos más (${formatMoney(rest.reduce((s, o) => s + o.total, 0))}).`
+    });
+  }
+  if (ambiguousMonths.size > 0) {
+    notes.push({
+      type: 'warn',
+      text: `En ${ambiguousMonths.size} mes(es) hay varios empleados a la vez (${[...ambiguousMonths].sort()[0]} y otros): Siigo registra los aportes (pensión, salud, cajas, ARL, SENA, ICBF) a nombre del fondo y no se pueden repartir por persona. Salen juntos como "SIN ASIGNAR (aportes)".`
     });
   }
   if (skippedNoDate > 0) {
-    notes.push({
-      type: 'warn',
-      text: `${skippedNoDate} fila(s) se omitieron por no tener una fecha válida en "Fecha elaboración".`
-    });
+    notes.push({ type: 'warn', text: `${skippedNoDate} línea(s) con fecha ilegible se omitieron.` });
   }
-  if (unknownFills.size > 0) {
-    const list = [...unknownFills.entries()].map(([hex, n]) => `#${hex} (${n})`).join(', ');
-    notes.push({
-      type: 'warn',
-      text: `Colores del movimiento que no están en la leyenda del cruce y se dejaron sin color: ${list}.`
-    });
-  }
-  notes.push({
-    type: 'info',
-    text: 'Este archivo se leyó como Movimiento CC (extracto contable) y se resumió como nómina: Concepto sale de CONCEPT_KEYWORDS, Empleado se toma de Tercero (o se infiere por fecha cuando falta, tanto en aportes patronales como en salario/prestaciones sin Tercero), y se agregó TOTAL EMPLOYEE COST por mes y empleado. Las filas quedan ordenadas por mes, empleado y el orden de aparición de cada concepto en el extracto.'
-  });
 
   return { records, notes };
-}
-
-// --- Consolidar varios Movimiento CC (varios archivos, p. ej. uno por rango de
-// fechas o por corrida contable) en un solo resultado -----------------------------
-// Igual que convertNominaFiles: junta las filas de todos los archivos antes de
-// convertir y llama a convertMovimientoRows una sola vez. Importa porque la
-// inferencia de empleado por fecha necesita ver, para una fecha dada, todas las
-// filas de esa fecha aunque hayan llegado en archivos distintos.
-export function convertMovimientoFiles(files, options = {}) {
-  // files: [{ rows, name? }, ...]
-  const usable = (files || []).filter((f) => f && Array.isArray(f.rows) && f.rows.length > 0);
-  if (usable.length === 0) return null;
-
-  const allRows = [];
-  for (const f of usable) {
-    allRows.push(...f.rows);
-  }
-
-  const result = convertMovimientoRows(allRows, options);
-  if (!result) return null;
-
-  const names = usable.map((f, i) => f.name || `archivo ${i + 1}`).join(', ');
-  result.notes.unshift({
-    type: 'info',
-    text: `Se consolidaron ${usable.length} archivo(s) de Movimiento CC en un solo resultado (${names}).`
-  });
-  return result;
 }

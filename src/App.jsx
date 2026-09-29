@@ -14,17 +14,22 @@ import {
   ChevronRight,
   FileSpreadsheet,
   X,
-  FileX2
+  FileX2,
+  Plus,
+  Trash2,
+  FileText
 } from 'lucide-react';
 import {
   convertNominaRows,
   convertNominaFiles,
   convertMovimientoRows,
   convertMovimientoFiles,
-  STATUS_COLORS,
-  cruzarCuenta28,
-  CUENTA28_STATUS_COLORS
+  STATUS_COLORS
 } from './nominaConverter';
+import {
+  convertFacturacionRows,
+  convertFacturacionFiles
+} from './facturacionConverter';
 
 // ============================================================================
 // LECTOR DE .xlsx / .xlsm CON JSZIP (sin librería xlsx/SheetJS)
@@ -44,7 +49,7 @@ import {
 // Nota: los valores de celda se devuelven crudos (número, texto o booleano),
 // tal como vienen en el XML. Una celda con formato de fecha llega como el
 // número de serie de Excel, no como un objeto Date — quien la use (por
-// ejemplo convertMovimientoRows) debe decodificarla.
+// ejemplo convertMovimientoRows o convertFacturacionRows) debe decodificarla.
 
 function colLettersToIndex(letters) {
   let result = 0;
@@ -331,13 +336,19 @@ function headerHint(sheets) {
 }
 
 // ============================================================================
-// PROCESAMIENTO: Nómina (formato ancho) o Movimiento CC -> formato largo
+// PROCESAMIENTO: Facturación EOR / Nómina (formato ancho) / Movimiento CC -> formato largo
 // ============================================================================
-// La lógica (qué es un bloque, cómo salen los conceptos, los colores) vive en
-// nominaConverter.js. Aquí solo se lee el libro y se intenta reconocer el
-// formato: primero nómina (bloques EMPLOYEE CODE / NAME); si ninguna hoja
-// tiene eso, se intenta como Movimiento CC de Siigo (Comprobante / Fecha
-// elaboración / Descripción / Débito / Crédito).
+// La lógica de cada formato vive en su conversor:
+//   - facturacionConverter.js : hoja INVOICING de facturación EOR
+//   - nominaConverter.js      : nómina (bloques por mes) y Movimiento CC de Siigo
+// Aquí solo se lee el libro y se intenta reconocer el formato, del más
+// específico al más general:
+//   1) Facturación EOR: encabezado con EMPLOYEE CODE, NAME y PAYROLL MONTH
+//      (+ SERVICE TYPE / CUSTOMER NAME). Va primero porque también tiene
+//      EMPLOYEE CODE y NAME y, si no, la nómina se la quedaría.
+//   2) Nómina: bloques EMPLOYEE CODE / NAME.
+//   3) Movimiento CC de Siigo: Comprobante / Fecha elaboración / Descripción /
+//      Débito / Crédito.
 
 async function readNominaFile(file) {
   const sheets = await readWorkbookSheetsWithJSZip(file);
@@ -358,7 +369,8 @@ function convertLoadedFile(loaded, unifyNames) {
       warning: loaded.readError,
       sourceType: null,
       nominaRows: null,
-      movimientoRows: null
+      movimientoRows: null,
+      facturacionRows: null
     };
   }
 
@@ -366,17 +378,33 @@ function convertLoadedFile(loaded, unifyNames) {
   let sourceType = null;
   let nominaRows = null; // filas de la hoja de nómina usada (para consolidar varios archivos)
   let movimientoRows = null; // filas de la hoja de Movimiento CC usada (para consolidar varios archivos)
+  let facturacionRows = null; // filas de la hoja de facturación usada (para consolidar varios archivos)
 
+  // 1) Facturación EOR (el nombre del archivo aporta el año: "... Agosto 2026.xlsx")
   for (const { rows } of loaded.sheets) {
-    const result = convertNominaRows(rows, { unifyNamesByCode: unifyNames });
+    const result = convertFacturacionRows(rows, { fileName: loaded.fileName });
     if (result) {
       converted = result;
-      sourceType = 'nomina';
-      nominaRows = rows;
-      break; // la primera hoja con bloques de nómina (las demás son auxiliares o el formato largo)
+      sourceType = 'facturacion';
+      facturacionRows = rows;
+      break; // la primera hoja con encabezado de facturación (la otra suele ser una tabla dinámica)
     }
   }
 
+  // 2) Nómina
+  if (!converted) {
+    for (const { rows } of loaded.sheets) {
+      const result = convertNominaRows(rows, { unifyNamesByCode: unifyNames });
+      if (result) {
+        converted = result;
+        sourceType = 'nomina';
+        nominaRows = rows;
+        break; // la primera hoja con bloques de nómina (las demás son auxiliares o el formato largo)
+      }
+    }
+  }
+
+  // 3) Movimiento CC
   if (!converted) {
     for (const { rows } of loaded.sheets) {
       const result = convertMovimientoRows(rows);
@@ -392,7 +420,7 @@ function convertLoadedFile(loaded, unifyNames) {
   let warning = null;
   if (!converted) {
     warning =
-      'No se reconoció el formato del archivo: ni bloques de nómina (encabezado con EMPLOYEE CODE y NAME) ni un Movimiento CC de Siigo (encabezado con Comprobante, Fecha elaboración, Descripción, Débito y Crédito).';
+      'No se reconoció el formato del archivo: ni facturación EOR (encabezado con EMPLOYEE CODE, NAME y Payroll Month), ni bloques de nómina (EMPLOYEE CODE y NAME), ni un Movimiento CC de Siigo (Comprobante, Fecha elaboración, Descripción, Débito y Crédito).';
     const hint = headerHint(loaded.sheets);
     if (hint) {
       warning += ` Primer encabezado que vi: ${hint}. Si es una nómina, agrega esos nombres a los alias de nominaConverter.js.`;
@@ -408,7 +436,8 @@ function convertLoadedFile(loaded, unifyNames) {
     warning,
     sourceType,
     nominaRows,
-    movimientoRows
+    movimientoRows,
+    facturacionRows
   };
 }
 
@@ -440,14 +469,10 @@ function colIndexToLetters(index) {
   return s;
 }
 
-const VALUE_COLUMNS = new Set([
-  'Valor Concepto', 'Valor Totales',
-  'Valor Nómina', 'Valor Siigo', 'Diferencia', 'Nómina mes', 'Siigo mes'
-]);
+const VALUE_COLUMNS = new Set(['Valor Concepto', 'Valor Totales']);
 const FILL_HEXES = Object.keys(STATUS_COLORS);
 const NUMBER_STYLE_PLAIN = 2;
 const NUMBER_STYLE_FIRST_FILL = 3;
-const STATUS_STYLE_FIRST_FILL = NUMBER_STYLE_FIRST_FILL + FILL_HEXES.length;
 
 // Ancho de cada columna en el Excel exportado (en caracteres).
 const EXCEL_COLUMN_WIDTH = {
@@ -496,10 +521,7 @@ function buildSheetXml(dataRows, columns) {
           const style = VALUE_COLUMNS.has(colName) ? numberStyleFor(row) : 0;
           return `<c r="${ref}" s="${style}"><v>${val}</v></c>`;
         }
-        const statusStyle = colName === 'Estado' && row._fill
-          ? STATUS_STYLE_FIRST_FILL + Math.max(0, FILL_HEXES.indexOf(row._fill))
-          : 0;
-        return `<c r="${ref}" s="${statusStyle}" t="inlineStr"><is><t>${xmlEscape(String(val))}</t></is></c>`;
+        return `<c r="${ref}" t="inlineStr"><is><t>${xmlEscape(String(val))}</t></is></c>`;
       })
       .join('');
     xmlRows += `<row r="${rowNum}">${cells}</row>`;
@@ -519,14 +541,11 @@ function buildStylesXml() {
     `<xf numFmtId="164" fontId="0" fillId="${fillId}" borderId="0" xfId="0" applyNumberFormat="1"${
       fillId ? ' applyFill="1"' : ''
     }/>`;
-  const textFillXf = (fillId) =>
-    `<xf numFmtId="0" fontId="0" fillId="${fillId}" borderId="0" xfId="0" applyFill="1"/>`;
   const cellXfs =
     '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
     '<xf numFmtId="17" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="left"/></xf>' +
     numberXf(0) +
-    FILL_HEXES.map((_, i) => numberXf(i + 2)).join('') +
-    FILL_HEXES.map((_, i) => textFillXf(i + 2)).join('');
+    FILL_HEXES.map((_, i) => numberXf(i + 2)).join('');
 
   // numFmtId 164 = formato contable (ceros como "-"), igual que la Hoja2 de ejemplo;
   // numFmtId 17 = mmm-yy (integrado).
@@ -537,7 +556,7 @@ function buildStylesXml() {
     `<fills count="${FILL_HEXES.length + 2}">${fills}</fills>` +
     '<borders count="1"><border/></borders>' +
     '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
-    `<cellXfs count="${FILL_HEXES.length * 2 + 3}">${cellXfs}</cellXfs>` +
+    `<cellXfs count="${FILL_HEXES.length + 3}">${cellXfs}</cellXfs>` +
     '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>' +
     '</styleSheet>'
   );
@@ -585,19 +604,6 @@ const OUTPUT_COLUMNS = [
   'Valor Totales'
 ];
 
-const CUENTA28_COLUMNS = [
-  'Empresa',
-  'Mes',
-  'Empleado',
-  'Concepto',
-  'Valor Nómina',
-  'Valor Siigo',
-  'Diferencia',
-  'Estado',
-  'Nómina mes',
-  'Siigo mes'
-];
-
 // Ancho mínimo de cada columna en la tabla de la pantalla (px).
 const COLUMN_MIN_WIDTH = {
   'Mes elaboración': 150,
@@ -610,25 +616,51 @@ const COLUMN_MIN_WIDTH = {
 // Etiqueta que se muestra junto al nombre del archivo, según qué formato se reconoció.
 const SOURCE_TYPE_LABEL = {
   nomina: 'Nómina',
-  movimiento: 'Movimiento CC'
+  movimiento: 'Movimiento CC',
+  facturacion: 'Facturación'
 };
 
+// Color de la etiqueta de cada tipo de archivo.
+const SOURCE_TYPE_BADGE = {
+  nomina: 'bg-indigo-50 text-indigo-700 ring-indigo-200',
+  movimiento: 'bg-sky-50 text-sky-700 ring-sky-200',
+  facturacion: 'bg-teal-50 text-teal-700 ring-teal-200'
+};
+
+const KNOWN_SOURCE_TYPES = ['nomina', 'movimiento', 'facturacion'];
+
+// Encabezado de cada tarjeta: número de paso + título + acciones a la derecha.
+function SectionHeader({ step, title, subtitle, children }) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 px-6 py-4 border-b border-slate-100">
+      <div className="flex items-center gap-3 min-w-0">
+        <span className="flex items-center justify-center w-7 h-7 rounded-full bg-blue-900 text-white text-xs font-bold shrink-0">
+          {step}
+        </span>
+        <div className="min-w-0">
+          <h2 className="text-base font-bold text-slate-900 leading-tight">{title}</h2>
+          {subtitle && <p className="text-xs text-slate-500 mt-0.5">{subtitle}</p>}
+        </div>
+      </div>
+      {children && <div className="flex items-center gap-2 flex-wrap">{children}</div>}
+    </div>
+  );
+}
+
 export default function App() {
-  const [showInstructions, setShowInstructions] = useState(true);
+  const [showInstructions, setShowInstructions] = useState(false);
   const [files, setFiles] = useState([]); // { fileId, fileName, empresa, sheets } | { ..., readError }
   const [unifyNames, setUnifyNames] = useState(true);
-  const [modo, setModo] = useState('cuenta28');
-  const [estadoFilter, setEstadoFilter] = useState('TODOS');
-  const [mesFilter, setMesFilter] = useState('TODOS');
-  const [conceptoFilter, setConceptoFilter] = useState('TODOS');
-  const [empresaFilter, setEmpresaFilter] = useState('TODOS');
+  const [consolidateNomina, setConsolidateNomina] = useState(false);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const rowsPerPage = 10;
 
   // Para bajar solos hasta el resultado cuando termina de procesar.
+  const fileInputRef = useRef(null);
   const fileListRef = useRef(null);
   const resultsRef = useRef(null);
   const scrollPending = useRef(false);
@@ -639,57 +671,57 @@ export default function App() {
     [files, unifyNames]
   );
 
-  const empresas = useMemo(
-    () => [...new Set(processed.map((f) => f.empresa).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
-    [processed]
-  );
+  // Consolidación de varios archivos de una misma empresa bajo la misma casilla:
+  // varias nóminas anchas (p. ej. los 4 a 6 archivos mensuales de RemoFirst),
+  // varios Movimiento CC (p. ej. un archivo por rango de fechas) y/o varias
+  // facturaciones EOR (p. ej. una por mes). Es opcional porque los códigos de
+  // empleado / nombres de empresas distintas podrían repetirse y mezclar datos.
+  // Para el Movimiento CC, además, consolidar antes de convertir es lo que
+  // permite que la inferencia de empleado por fecha (en aportes patronales y en
+  // filas de salario sin Tercero) vea todas las filas de una misma fecha aunque
+  // hayan llegado en archivos distintos.
+  const nominaConsolidation = useMemo(() => {
+    if (!consolidateNomina) return null;
+    const inputs = processed
+      .filter((f) => f.sourceType === 'nomina' && f.nominaRows)
+      .map((f) => ({ rows: f.nominaRows, name: f.fileName }));
+    if (inputs.length < 2) return null;
+    return convertNominaFiles(inputs, { unifyNamesByCode: unifyNames });
+  }, [processed, consolidateNomina, unifyNames]);
 
-  const sourceRows = useMemo(() => {
-    const relevant = empresaFilter === 'TODOS'
-      ? processed
-      : processed.filter((f) => f.empresa === empresaFilter);
-    const nominaRows = relevant
-      .filter((f) => f.sourceType === 'nomina')
-      .flatMap((f) => f.rows);
-    const movimientoRows = relevant
-      .filter((f) => f.sourceType === 'movimiento')
-      .flatMap((f) => f.rows);
-    return { nominaRows, movimientoRows };
-  }, [processed, empresaFilter]);
+  const movimientoConsolidation = useMemo(() => {
+    if (!consolidateNomina) return null;
+    const inputs = processed
+      .filter((f) => f.sourceType === 'movimiento' && f.movimientoRows)
+      .map((f) => ({ rows: f.movimientoRows, name: f.fileName }));
+    if (inputs.length < 2) return null;
+    return convertMovimientoFiles(inputs);
+  }, [processed, consolidateNomina]);
 
-  const cuenta28 = useMemo(() => {
-    // El cruce se hace por empresa. No mezclamos personas/conceptos de compañías
-    // distintas aunque el usuario haya cargado todos los archivos juntos.
-    const relevant = empresaFilter === 'TODOS' ? processed : processed.filter((f) => f.empresa === empresaFilter);
-    if (empresaFilter !== 'TODOS') {
-      return cruzarCuenta28(sourceRows.nominaRows, sourceRows.movimientoRows);
-    }
-
-    const groups = new Map();
-    for (const f of relevant) {
-      if (!groups.has(f.empresa)) groups.set(f.empresa, { nomina: [], movimiento: [] });
-      if (f.sourceType === 'nomina') groups.get(f.empresa).nomina.push(...f.rows);
-      if (f.sourceType === 'movimiento') groups.get(f.empresa).movimiento.push(...f.rows);
-    }
-
-    const rows = [];
-    const summary = { total: 0, OK: 0, DIFERENCIA: 0, SOLO_NOMINA: 0, SOLO_SIIGO: 0, CRUZA_ENTRE_MESES: 0 };
-    const months = new Set();
-    for (const [empresa, group] of groups) {
-      const result = cruzarCuenta28(group.nomina, group.movimiento);
-      for (const row of result.rows) rows.push({ ...row, Empresa: empresa });
-      for (const m of result.months) months.add(m);
-      Object.keys(summary).forEach((key) => { summary[key] += result.summary[key] || 0; });
-    }
-    return { rows, summary, months: [...months].sort() };
-  }, [processed, empresaFilter, sourceRows]);
+  const facturacionConsolidation = useMemo(() => {
+    if (!consolidateNomina) return null;
+    const inputs = processed
+      .filter((f) => f.sourceType === 'facturacion' && f.facturacionRows)
+      .map((f) => ({ rows: f.facturacionRows, name: f.fileName }));
+    if (inputs.length < 2) return null;
+    return convertFacturacionFiles(inputs);
+  }, [processed, consolidateNomina]);
 
   const consolidatedRows = useMemo(() => {
-    if (modo === 'cuenta28') {
-      return cuenta28.rows.map((row) => ({ ...row, Empresa: row.Empresa || empresaFilter }));
-    }
-    return [...sourceRows.nominaRows, ...sourceRows.movimientoRows];
-  }, [modo, cuenta28.rows, sourceRows]);
+    const nominaRows = nominaConsolidation
+      ? nominaConsolidation.records
+      : processed.filter((f) => f.sourceType === 'nomina').flatMap((f) => f.rows);
+    const movimientoRows = movimientoConsolidation
+      ? movimientoConsolidation.records
+      : processed.filter((f) => f.sourceType === 'movimiento').flatMap((f) => f.rows);
+    const facturacionRows = facturacionConsolidation
+      ? facturacionConsolidation.records
+      : processed.filter((f) => f.sourceType === 'facturacion').flatMap((f) => f.rows);
+    const otherRows = processed
+      .filter((f) => !KNOWN_SOURCE_TYPES.includes(f.sourceType))
+      .flatMap((f) => f.rows);
+    return [...nominaRows, ...movimientoRows, ...facturacionRows, ...otherRows];
+  }, [processed, nominaConsolidation, movimientoConsolidation, facturacionConsolidation]);
 
   // Colores presentes en el resultado, para la leyenda.
   const legendColors = useMemo(() => {
@@ -697,12 +729,6 @@ export default function App() {
     for (const row of consolidatedRows) if (row._fill) used.add(row._fill);
     return Object.keys(STATUS_COLORS).filter((hex) => used.has(hex));
   }, [consolidatedRows]);
-
-  const cuenta28Months = cuenta28.months;
-  const cuenta28Concepts = useMemo(
-    () => [...new Set(cuenta28.rows.map((r) => r.Concepto))].sort((a, b) => a.localeCompare(b)),
-    [cuenta28.rows]
-  );
 
   useEffect(() => {
     if (loading || !scrollPending.current) return;
@@ -713,8 +739,8 @@ export default function App() {
     }
   }, [files, loading]);
 
-  const handleFileUpload = async (e) => {
-    const uploaded = Array.from(e.target.files || []);
+  // Lee y agrega archivos (viene del selector, del botón "Nuevo archivo" o de arrastrar y soltar).
+  const processUploadedFiles = async (uploaded) => {
     if (uploaded.length === 0) return;
 
     setLoading(true);
@@ -741,9 +767,25 @@ export default function App() {
       setFiles((prev) => [...prev, ...results]);
     } finally {
       setLoading(false);
-      e.target.value = '';
     }
   };
+
+  const handleFileUpload = async (e) => {
+    const uploaded = Array.from(e.target.files || []);
+    await processUploadedFiles(uploaded);
+    e.target.value = '';
+  };
+
+  const handleDrop = async (e) => {
+    e.preventDefault();
+    setDragging(false);
+    const dropped = Array.from(e.dataTransfer.files || []).filter((f) =>
+      /\.(xlsx|xlsm)$/i.test(f.name)
+    );
+    await processUploadedFiles(dropped);
+  };
+
+  const openFilePicker = () => fileInputRef.current?.click();
 
   const removeFile = useCallback((fileId) => {
     setFiles((prev) => prev.filter((f) => f.fileId !== fileId));
@@ -754,28 +796,15 @@ export default function App() {
     setFiles([]);
     setSearchTerm('');
     setCurrentPage(1);
-    setEmpresaFilter('TODOS');
-    setEstadoFilter('TODOS');
-    setMesFilter('TODOS');
-    setConceptoFilter('TODOS');
   };
 
   const filteredData = useMemo(() => {
-    let data = consolidatedRows;
-    if (modo === 'cuenta28') {
-      if (estadoFilter !== 'TODOS') data = data.filter((r) => r.Estado === estadoFilter);
-      if (mesFilter !== 'TODOS') data = data.filter((r) => r.Mes === mesFilter);
-      if (conceptoFilter !== 'TODOS') data = data.filter((r) => r.Concepto === conceptoFilter);
-    }
-    if (!searchTerm.trim()) return data;
+    if (!searchTerm.trim()) return consolidatedRows;
     const term = searchTerm.toLowerCase();
-    return data.filter((row) => {
-      const values = modo === 'cuenta28'
-        ? [row.Mes, row.Empleado, row.Concepto, row['Valor Nómina'], row['Valor Siigo'], row.Diferencia, row.Estado]
-        : OUTPUT_COLUMNS.map((col) => row[col]);
-      return values.some((v) => formatCellValue(v).toLowerCase().includes(term));
-    });
-  }, [consolidatedRows, searchTerm, modo, estadoFilter, mesFilter, conceptoFilter]);
+    return consolidatedRows.filter((row) =>
+      OUTPUT_COLUMNS.some((col) => formatCellValue(row[col]).toLowerCase().includes(term))
+    );
+  }, [consolidatedRows, searchTerm]);
 
   const totalPages = Math.ceil(filteredData.length / rowsPerPage) || 1;
   const paginatedData = useMemo(() => {
@@ -787,12 +816,11 @@ export default function App() {
     if (filteredData.length === 0) return;
     setExporting(true);
     try {
-      const exportColumns = modo === 'cuenta28' ? CUENTA28_COLUMNS : OUTPUT_COLUMNS;
-      const blob = await buildXlsxBlobWithJSZip(filteredData, exportColumns);
+      const blob = await buildXlsxBlobWithJSZip(filteredData, OUTPUT_COLUMNS);
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = modo === 'cuenta28' ? 'cuenta_28_cruce.xlsx' : 'nomina_formato_largo.xlsx';
+      link.download = 'nomina_formato_largo.xlsx';
       link.click();
       URL.revokeObjectURL(url);
     } finally {
@@ -802,11 +830,13 @@ export default function App() {
 
   const downloadCSV = () => {
     if (filteredData.length === 0) return;
-    const columns = modo === 'cuenta28' ? CUENTA28_COLUMNS : OUTPUT_COLUMNS;
-    const headerLine = columns.join(',');
+    const headerLine = OUTPUT_COLUMNS.join(',');
+    // Los montos van como número plano (sin puntos de miles) para poder sumar y filtrar en Excel.
     const lines = filteredData.map((row) =>
-      columns.map((col) =>
-        typeof row[col] === 'number' ? String(row[col]) : `"${formatCellValue(row[col]).replace(/"/g, '""')}"`
+      OUTPUT_COLUMNS.map((col) =>
+        VALUE_COLUMNS.has(col)
+          ? String(row[col])
+          : `"${formatCellValue(row[col]).replace(/"/g, '""')}"`
       ).join(',')
     );
     const csvContent = [headerLine, ...lines].join('\n');
@@ -814,107 +844,168 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = modo === 'cuenta28' ? 'cuenta_28_cruce.csv' : 'nomina_formato_largo.csv';
+    link.download = 'nomina_formato_largo.csv';
     link.click();
     URL.revokeObjectURL(url);
   };
 
   const downloadJSON = () => {
     if (filteredData.length === 0) return;
-    const columns = modo === 'cuenta28' ? CUENTA28_COLUMNS : OUTPUT_COLUMNS;
+    // Las fechas se serializan como "yyyy-mm-dd" en vez del ISO string con
+    // hora que produciría JSON.stringify por defecto sobre un objeto Date.
     const serializable = filteredData.map((row) => {
       const obj = {};
-      columns.forEach((col) => {
+      OUTPUT_COLUMNS.forEach((col) => {
         obj[col] = row[col] instanceof Date ? formatCellValue(row[col]) : row[col];
       });
       return obj;
     });
-    const blob = new Blob([JSON.stringify(serializable, null, 2)], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify(serializable, null, 2)], {
+      type: 'application/json'
+    });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = modo === 'cuenta28' ? 'cuenta_28_cruce.json' : 'nomina_formato_largo.json';
+    link.download = 'nomina_formato_largo.json';
     link.click();
     URL.revokeObjectURL(url);
   };
 
   const totalWarnings = processed.filter((f) => f.warning).length;
+  const hasFiles = files.length > 0;
+  const hasResults = consolidatedRows.length > 0;
 
-  const tableColumns = modo === 'cuenta28' ? CUENTA28_COLUMNS : OUTPUT_COLUMNS;
+  // Los ceros se muestran como "-" (igual que el formato contable del Excel) y los
+  // montos llevan el color que traía la nómina, en las dos columnas de valor.
   const renderCell = (row, col) => {
     const value = row[col];
-    if (modo === 'cuenta28' && ['Valor Nómina', 'Valor Siigo', 'Diferencia', 'Nómina mes', 'Siigo mes'].includes(col)) {
-      return Number(value || 0).toLocaleString('es-CO');
-    }
-    if (modo !== 'cuenta28' && VALUE_COLUMNS.has(col) && value === 0) return '-';
+    if (VALUE_COLUMNS.has(col) && value === 0) return '-';
     return formatCellValue(value);
   };
   const cellClass = (col) => {
-    const base = 'px-4 py-2.5 whitespace-nowrap';
-    return (modo === 'cuenta28' && ['Valor Nómina', 'Valor Siigo', 'Diferencia', 'Nómina mes', 'Siigo mes'].includes(col)) ||
-      (modo !== 'cuenta28' && VALUE_COLUMNS.has(col)) ? `${base} text-right` : base;
+    const base = 'px-5 py-2.5 whitespace-nowrap';
+    return VALUE_COLUMNS.has(col) ? `${base} text-right tabular-nums` : base;
   };
   const cellStyle = (row, col) => {
-    const style = { minWidth: modo === 'cuenta28' ? 150 : COLUMN_MIN_WIDTH[col] };
-    if (modo === 'cuenta28' && col === 'Estado' && row._fill) style.backgroundColor = `#${row._fill}`;
-    if (modo !== 'cuenta28' && VALUE_COLUMNS.has(col) && row._fill) style.backgroundColor = `#${row._fill}`;
+    const style = { minWidth: COLUMN_MIN_WIDTH[col] };
+    if (VALUE_COLUMNS.has(col) && row._fill) style.backgroundColor = `#${row._fill}`;
     return style;
   };
 
+  // Panel de avisos de una consolidación (nómina, Movimiento CC o facturación).
+  const renderConsolidationPanel = (title, consolidation) =>
+    consolidation && (
+      <div className="px-4 py-3 rounded-xl border border-blue-200 bg-blue-50/60 text-xs space-y-1">
+        <p className="font-semibold text-blue-900">{title}</p>
+        <ul className="pl-4 space-y-1 list-disc">
+          {consolidation.notes.map((n, i) => (
+            <li key={i} className={n.type === 'warn' ? 'text-amber-800' : 'text-slate-600'}>
+              {n.text}
+            </li>
+          ))}
+        </ul>
+      </div>
+    );
+
+  // Progreso de los tres pasos.
+  const steps = [
+    { label: 'Cargar archivos', done: hasFiles },
+    { label: 'Revisar avisos', done: hasResults },
+    { label: 'Exportar', done: false }
+  ];
+  const activeStep = !hasFiles ? 0 : !hasResults ? 1 : 2;
+
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 font-sans">
+    <div className="min-h-screen bg-slate-100 text-slate-800 font-sans">
+      {/* Selector de archivos compartido por la zona de carga y el botón "Nuevo archivo" */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".xlsx,.xlsm"
+        multiple
+        onChange={handleFileUpload}
+        className="hidden"
+      />
+
       {/* Header */}
-      <header className="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between shadow-sm">
-        <div className="flex items-center gap-3">
-          <img src="/logo.jpeg" alt="Logo" className="h-14 w-auto object-contain" />
-        </div>
-        <div className="flex items-center gap-2.5 border border-slate-200 bg-slate-50 px-5 py-2 rounded-full text-sm font-semibold text-slate-700 cursor-pointer hover:bg-slate-100 transition-colors">
+      <header className="bg-white border-b border-slate-200 px-6 sm:px-8 py-3 flex items-center justify-between">
+        <img src="/logo.jpeg" alt="Logo" className="h-12 w-auto object-contain" />
+        <div className="flex items-center gap-2.5 border border-slate-200 bg-slate-50 px-4 py-2 rounded-full text-sm font-semibold text-slate-700">
           <User className="w-4 h-4 text-blue-600" />
           <span>Bienvenido Usuario</span>
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto px-6 py-10 space-y-8">
-        {/* Título */}
-        <div className="text-center space-y-3">
-          <h1 className="text-3xl font-extrabold text-slate-900 tracking-tight">
-            Automatización y Cruce Contable
-          </h1>
-          <p className="text-sm text-slate-600 max-w-2xl mx-auto leading-relaxed">
-            Carga la nómina y el Movimiento CC de Siigo. La herramienta convierte ambos formatos,
-            cruza mes + empleado + concepto y muestra cruces correctos, diferencias, registros que
-            solo aparecen en un lado y conceptos que cruzan entre meses.
-          </p>
-        </div>
+      {/* Banda de título */}
+      <section className="bg-blue-950 text-white">
+        <div className="max-w-6xl mx-auto px-6 pt-10 pb-24 flex flex-wrap items-end justify-between gap-8">
+          <div className="max-w-2xl space-y-3">
+            <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight leading-tight">
+              Convertidor a formato largo
+            </h1>
+            <p className="text-sm text-blue-100/80 leading-relaxed">
+              Carga la nómina, la facturación EOR o el Movimiento CC de Siigo. La app reconoce
+              sola cada formato y te devuelve una tabla lista para filtrar y cruzar la cuenta 28.
+            </p>
+          </div>
 
+          {/* Pasos */}
+          <ol className="flex items-center gap-2 text-xs font-medium">
+            {steps.map((s, i) => (
+              <li key={s.label} className="flex items-center gap-2">
+                <span
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-full ring-1 transition-colors ${
+                    i === activeStep
+                      ? 'bg-white text-blue-950 ring-white'
+                      : s.done
+                      ? 'bg-blue-900 text-blue-100 ring-blue-700'
+                      : 'bg-transparent text-blue-200/70 ring-blue-800'
+                  }`}
+                >
+                  {s.done && i !== activeStep ? (
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                  ) : (
+                    <span className="font-bold">{i + 1}</span>
+                  )}
+                  {s.label}
+                </span>
+                {i < steps.length - 1 && <span className="w-4 h-px bg-blue-800" />}
+              </li>
+            ))}
+          </ol>
+        </div>
+      </section>
+
+      <main className="max-w-6xl mx-auto px-6 -mt-16 pb-16 space-y-6">
         {/* Instrucciones */}
-        <div className="bg-blue-50/60 border border-blue-200/80 rounded-2xl overflow-hidden transition-all duration-200 shadow-sm">
+        <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
           <button
             onClick={() => setShowInstructions(!showInstructions)}
-            className="w-full px-6 py-4 flex items-center justify-between text-left hover:bg-blue-100/30 transition-colors cursor-pointer"
+            className="w-full px-6 py-3.5 flex items-center justify-between text-left hover:bg-slate-50 transition-colors cursor-pointer"
           >
-            <div className="flex items-center gap-3 text-blue-900 font-bold text-base">
-              <Info className="w-5 h-5 text-blue-600 shrink-0" />
+            <div className="flex items-center gap-3 text-slate-900 font-semibold text-sm">
+              <Info className="w-4 h-4 text-blue-600 shrink-0" />
               <span>¿Cómo usar esta herramienta?</span>
             </div>
             {showInstructions ? (
-              <ChevronUp className="w-5 h-5 text-blue-800" />
+              <ChevronUp className="w-4 h-4 text-slate-500" />
             ) : (
-              <ChevronDown className="w-5 h-5 text-blue-800" />
+              <ChevronDown className="w-4 h-4 text-slate-500" />
             )}
           </button>
           {showInstructions && (
-            <div className="px-6 pb-6 pt-2 border-t border-blue-100 text-xs text-slate-700 space-y-2.5 leading-relaxed">
+            <div className="px-6 pb-6 pt-4 border-t border-slate-100 text-xs text-slate-700 space-y-3 leading-relaxed">
               <p>
                 <strong className="text-slate-900">1. Cargar el archivo:</strong> puede ser la
+                facturación EOR (hoja INVOICING, con EMPLOYEE CODE, NAME y Payroll Month), la
                 nómina que se envía a facturación (un bloque por mes, encabezado con EMPLOYEE CODE
                 y NAME) o el Movimiento CC de Siigo (encabezado con Comprobante, Fecha elaboración,
-                Descripción, Débito y Crédito). La app prueba primero como nómina y, si no
-                encuentra bloques, como Movimiento CC. Puedes seleccionar varios archivos a la vez,
-                incluso mezclando los dos tipos. Si son varios archivos de una misma empresa —
-                varias nóminas (p. ej. los de RemoFirst) o varios Movimiento CC (p. ej. uno por
-                rango de fechas) — se pueden cargar juntos; la herramienta los agrupa por empresa
-                antes de hacer el cruce.
+                Descripción, Débito y Crédito). La app prueba primero como facturación, luego como
+                nómina y, si no encuentra bloques, como Movimiento CC. Puedes seleccionar varios
+                archivos a la vez, incluso mezclando los tipos. Si son varios archivos de una misma
+                empresa — varias nóminas (p. ej. los de RemoFirst), varias facturaciones (una por
+                mes) o varios Movimiento CC (p. ej. uno por rango de fechas) — marca la casilla de
+                consolidar para que se junten antes de convertir.
               </p>
               <p>
                 <strong className="text-slate-900">2. Qué sale de la nómina:</strong> una fila por
@@ -923,7 +1014,16 @@ export default function App() {
                 conceptos en cero no se listan.
               </p>
               <p>
-                <strong className="text-slate-900">3. Qué sale del Movimiento CC:</strong> cada
+                <strong className="text-slate-900">3. Qué sale de la facturación EOR:</strong> lo
+                mismo que de la nómina (una fila por mes, empleado y concepto, más el TOTAL
+                EMPLOYEE COST), leyendo todas las columnas de costo hasta TOTAL EMPLOYEE COST
+                (salario, seguridad social, prestaciones y otros costos del empleador). No se
+                incluyen FEE, BANKING TAX, IVA ni las columnas en USD. El mes sale de la columna
+                Payroll Month y el año del nombre del archivo (p. ej. "... Agosto 2026.xlsx"); las
+                filas de "Monthly Adjustment" de meses anteriores quedan en su propio mes.
+              </p>
+              <p>
+                <strong className="text-slate-900">4. Qué sale del Movimiento CC:</strong> cada
                 Descripción se clasifica a un concepto tipo nómina (SALARY, PENSION COST, HEALTH
                 COST…) con la tabla CONCEPT_KEYWORDS, se suma por mes, concepto y empleado (Débito −
                 Crédito) y se agrega TOTAL EMPLOYEE COST por mes y empleado. Los aportes patronales,
@@ -932,16 +1032,11 @@ export default function App() {
                 Lo que no se reconoce queda con el texto de Descripción y se avisa.
               </p>
               <p>
-                <strong className="text-slate-900">4. Cruce contable:</strong> se compara por empresa,
-                mes, empleado y concepto. Verde = OK, rojo = diferencia, amarillo = solo aparece en
-                un lado y verde = cruza entre meses para conceptos acumulativos como la prima.
-              </p>
-              <p>
-                <strong className="text-slate-900">5. Colores del archivo:</strong> son los que ya trae el
+                <strong className="text-slate-900">5. Colores:</strong> son los que ya trae el
                 archivo (el resultado del cruce con Siigo): verde y azul = cruce ok, amarillo = no
                 está en el otro lado, rojo = diferencias, verde limón = cruza entre meses, morado =
-                débito y crédito se anulan. Si el archivo aún no está pintado, las filas salen sin
-                color.
+                débito y crédito se anulan. Si el archivo aún no está pintado (o es una
+                facturación), las filas salen sin color.
               </p>
               <p>
                 <strong className="text-slate-900">6. Los avisos</strong> bajo cada archivo indican
@@ -956,260 +1051,254 @@ export default function App() {
           )}
         </div>
 
-        {/* Modo y filtros Cuenta 28 */}
-        <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
-          <div className="flex flex-wrap items-center gap-3">
-            <span className="text-sm font-bold text-slate-800">Modo:</span>
-            <button
-              onClick={() => setModo('cuenta28')}
-              className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
-                modo === 'cuenta28'
-                  ? 'bg-blue-900 text-white'
-                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-              }`}
-            >
-              Cruce contable
-            </button>
-            <button
-              onClick={() => setModo('largo')}
-              className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
-                modo === 'largo'
-                  ? 'bg-blue-900 text-white'
-                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-              }`}
-            >
-              Formato largo
-            </button>
-          </div>
-          {modo === 'cuenta28' && (
-            <>
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-                <select
-                  value={empresaFilter}
-                  onChange={(e) => { setEmpresaFilter(e.target.value); setCurrentPage(1); }}
-                  className="border border-slate-200 rounded-lg px-3 py-2 text-xs cursor-pointer hover:border-slate-300 focus:outline-none focus:border-blue-500 transition-colors"
-                >
-                  <option value="TODOS">Todas las empresas</option>
-                  {empresas.map((e) => <option key={e} value={e}>{e}</option>)}
-                </select>
-                <select
-                  value={estadoFilter}
-                  onChange={(e) => { setEstadoFilter(e.target.value); setCurrentPage(1); }}
-                  className="border border-slate-200 rounded-lg px-3 py-2 text-xs cursor-pointer hover:border-slate-300 focus:outline-none focus:border-blue-500 transition-colors"
-                >
-                  <option value="TODOS">Todos los estados</option>
-                  <option value="OK">🟢 Cruce OK</option>
-                  <option value="DIFERENCIA">🔴 Diferencias</option>
-                  <option value="SOLO_NOMINA">🟡 Solo nómina</option>
-                  <option value="SOLO_SIIGO">🟡 Solo Siigo</option>
-                  <option value="CRUZA_ENTRE_MESES">🟢 Cruza entre meses</option>
-                </select>
-                <select
-                  value={mesFilter}
-                  onChange={(e) => { setMesFilter(e.target.value); setCurrentPage(1); }}
-                  className="border border-slate-200 rounded-lg px-3 py-2 text-xs cursor-pointer hover:border-slate-300 focus:outline-none focus:border-blue-500 transition-colors"
-                >
-                  <option value="TODOS">Todos los meses</option>
-                  {cuenta28Months.map((m) => <option key={m} value={m}>{m}</option>)}
-                </select>
-                <select
-                  value={conceptoFilter}
-                  onChange={(e) => { setConceptoFilter(e.target.value); setCurrentPage(1); }}
-                  className="border border-slate-200 rounded-lg px-3 py-2 text-xs cursor-pointer hover:border-slate-300 focus:outline-none focus:border-blue-500 transition-colors"
-                >
-                  <option value="TODOS">Todos los conceptos</option>
-                  {cuenta28Concepts.map((c) => <option key={c} value={c}>{c}</option>)}
-                </select>
-              </div>
-                <div className="grid grid-cols-2 md:grid-cols-6 gap-2">
-                {[['Total', cuenta28.summary.total], ['OK', cuenta28.summary.OK], ['Diferencias', cuenta28.summary.DIFERENCIA], ['Solo nómina', cuenta28.summary.SOLO_NOMINA], ['Solo Siigo', cuenta28.summary.SOLO_SIIGO], ['Cruza meses', cuenta28.summary.CRUZA_ENTRE_MESES]].map(([label, value]) => (
-                  <div key={label} className="bg-slate-50 border border-slate-200 rounded-lg p-3">
-                    <div className="text-[11px] text-slate-500">{label}</div>
-                    <div className="text-xl font-extrabold text-slate-800">{value}</div>
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
-
-        {/* Zona de carga */}
-        <div className="bg-white border-2 border-dashed border-slate-300 rounded-2xl p-10 shadow-sm text-center relative hover:border-blue-500 transition-colors cursor-pointer">
-          <input
-            type="file"
-            accept=".xlsx,.xlsm"
-            multiple
-            onChange={handleFileUpload}
-            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+        {/* Paso 1: carga */}
+        <section className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+          <SectionHeader
+            step="1"
+            title="Cargar archivos"
+            subtitle="Formatos .xlsx y .xlsm. Puedes mezclar nóminas, facturación y Movimiento CC."
           />
-          <div className="flex flex-col items-center gap-3">
-            <div className="p-4 bg-blue-50 text-blue-600 rounded-full">
-              <Upload className="w-7 h-7" />
+          <div className="p-6">
+            <div
+              role="button"
+              tabIndex={0}
+              onClick={openFilePicker}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  openFilePicker();
+                }
+              }}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragging(true);
+              }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={handleDrop}
+              className={`border-2 border-dashed rounded-xl text-center cursor-pointer transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                hasFiles ? 'p-5' : 'p-10'
+              } ${
+                dragging
+                  ? 'border-blue-500 bg-blue-50'
+                  : 'border-slate-300 bg-slate-50 hover:border-blue-400 hover:bg-blue-50/40'
+              }`}
+            >
+              <div
+                className={`flex items-center justify-center gap-4 ${
+                  hasFiles ? 'flex-row' : 'flex-col'
+                }`}
+              >
+                <div className="p-3 bg-blue-100 text-blue-700 rounded-full">
+                  <Upload className={hasFiles ? 'w-5 h-5' : 'w-6 h-6'} />
+                </div>
+                <div className={hasFiles ? 'text-left' : ''}>
+                  <p className="font-semibold text-sm text-slate-800">
+                    {hasFiles
+                      ? 'Arrastra más archivos aquí o haz clic para agregarlos'
+                      : 'Arrastra tus archivos aquí o haz clic para buscarlos'}
+                  </p>
+                  <p className="text-xs text-slate-500 mt-1">
+                    Se suman al consolidado que ya tienes cargado.
+                  </p>
+                </div>
+              </div>
             </div>
-            <div>
-              <p className="font-semibold text-base text-slate-800">
-                Arrastra la nómina o el Movimiento CC (.xlsx / .xlsm) o haz clic para buscar
-              </p>
-              <p className="text-xs text-slate-500 mt-1">
-                Puedes seleccionar varios archivos a la vez, incluso mezclando los dos tipos — se
-                van sumando al consolidado
-              </p>
-            </div>
-          </div>
-        </div>
 
-        {loading && (
-          <div className="flex items-center justify-center gap-2 text-blue-700 py-4">
-            <div className="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
-            <span className="text-xs font-medium">Leyendo y transformando archivos...</span>
+            {loading && (
+              <div className="flex items-center justify-center gap-2 text-blue-700 pt-5">
+                <div className="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
+                <span className="text-xs font-medium">Leyendo y transformando archivos...</span>
+              </div>
+            )}
           </div>
-        )}
+        </section>
 
-        {/* Lista de archivos cargados */}
-        {files.length > 0 && !loading && (
-          <div
+        {/* Paso 2: archivos cargados */}
+        {hasFiles && !loading && (
+          <section
             ref={fileListRef}
-            className="bg-white border border-slate-200 rounded-2xl shadow-sm p-4 space-y-2 scroll-mt-6"
+            className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden scroll-mt-6"
           >
-            <div className="flex items-center justify-between mb-1">
-              <h2 className="text-sm font-bold text-slate-800">
-                Archivos cargados ({files.length})
-              </h2>
-              <div className="flex items-center gap-4 flex-wrap justify-end">
-                <label className="flex items-center gap-1.5 text-xs text-slate-600 cursor-pointer">
+            <SectionHeader
+              step="2"
+              title={`Archivos cargados (${files.length})`}
+              subtitle="Revisa que cada archivo se haya reconocido bien."
+            >
+              <button
+                onClick={openFilePicker}
+                className="flex items-center gap-1.5 px-3.5 py-2 bg-blue-900 hover:bg-blue-800 text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                Nuevo archivo
+              </button>
+              <button
+                onClick={clearAll}
+                className="flex items-center gap-1.5 px-3.5 py-2 bg-white border border-red-200 text-red-600 hover:bg-red-50 font-semibold text-xs rounded-lg transition-colors cursor-pointer"
+              >
+                <Trash2 className="w-4 h-4" />
+                Quitar todos
+              </button>
+            </SectionHeader>
+
+            <div className="p-6 space-y-4">
+              {/* Opciones */}
+              <div className="flex flex-wrap gap-x-6 gap-y-2 px-4 py-3 rounded-xl bg-slate-50 border border-slate-200">
+                <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={unifyNames}
                     onChange={(e) => setUnifyNames(e.target.checked)}
-                    className="cursor-pointer"
+                    className="accent-blue-900"
                   />
                   Unificar el nombre de cada empleado por código (solo nómina)
                 </label>
-                <button
-                  onClick={clearAll}
-                  className="text-xs font-medium text-slate-500 hover:text-red-600 transition-colors cursor-pointer"
-                >
-                  Quitar todos
-                </button>
+                <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={consolidateNomina}
+                    onChange={(e) => setConsolidateNomina(e.target.checked)}
+                    className="accent-blue-900"
+                  />
+                  Varios archivos de una misma empresa: consolidar
+                </label>
               </div>
-            </div>
-            {processed.map((f) => (
-              <div
-                key={f.fileId}
-                className={`px-3 py-2 rounded-lg border text-xs space-y-1.5 ${
-                  f.warning ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-200'
-                }`}
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-2 min-w-0">
-                    {f.warning ? (
-                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                    ) : (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                    )}
-                    <div className="min-w-0">
-                      <p className="font-semibold text-slate-800 truncate">
-                        {f.fileName}
-                        {f.sourceType && (
-                          <span className="ml-2 inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide bg-slate-200 text-slate-600 align-middle">
-                            {SOURCE_TYPE_LABEL[f.sourceType]}
-                          </span>
-                        )}
-                      </p>
-                      <p className="text-slate-500">
-                        {f.warning ? f.warning : `${f.rows.length} filas generadas`}
-                      </p>
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => removeFile(f.fileId)}
-                    className="p-1 rounded hover:bg-white text-slate-400 hover:text-red-600 transition-colors cursor-pointer shrink-0"
-                    title="Quitar este archivo"
+
+              {/* Lista */}
+              <div className="space-y-2.5">
+                {processed.map((f) => (
+                  <div
+                    key={f.fileId}
+                    className={`rounded-xl border px-4 py-3 text-xs space-y-2 ${
+                      f.warning ? 'bg-amber-50/70 border-amber-200' : 'bg-white border-slate-200'
+                    }`}
                   >
-                    <X className="w-4 h-4" />
-                  </button>
-                </div>
-                {f.notes && f.notes.length > 0 && (
-                  <ul className="pl-6 space-y-1">
-                    {f.notes.map((note, idx) => (
-                      <li
-                        key={idx}
-                        className={note.type === 'warn' ? 'text-amber-800' : 'text-slate-600'}
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div
+                          className={`p-2 rounded-lg shrink-0 ${
+                            f.warning ? 'bg-amber-100 text-amber-700' : 'bg-emerald-50 text-emerald-600'
+                          }`}
+                        >
+                          {f.warning ? (
+                            <AlertTriangle className="w-4 h-4" />
+                          ) : (
+                            <FileText className="w-4 h-4" />
+                          )}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <p className="font-semibold text-slate-800 truncate text-sm">
+                              {f.fileName}
+                            </p>
+                            {f.sourceType && (
+                              <span
+                                className={`shrink-0 px-2 py-0.5 rounded-full text-[11px] font-semibold ring-1 ${SOURCE_TYPE_BADGE[f.sourceType]}`}
+                              >
+                                {SOURCE_TYPE_LABEL[f.sourceType]}
+                              </span>
+                            )}
+                          </div>
+                          <p className={f.warning ? 'text-amber-800 mt-0.5' : 'text-slate-500 mt-0.5'}>
+                            {f.warning ? f.warning : `${f.rows.length} filas generadas`}
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => removeFile(f.fileId)}
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-slate-600 hover:text-red-600 hover:border-red-200 hover:bg-red-50 font-medium transition-colors cursor-pointer shrink-0"
+                        title="Quitar este archivo"
                       >
-                        {note.text}
-                      </li>
-                    ))}
-                  </ul>
-                )}
+                        <X className="w-3.5 h-3.5" />
+                        Quitar archivo
+                      </button>
+                    </div>
+                    {f.notes && f.notes.length > 0 && (
+                      <ul className="pl-12 space-y-1 list-disc marker:text-slate-300">
+                        {f.notes.map((note, idx) => (
+                          <li
+                            key={idx}
+                            className={note.type === 'warn' ? 'text-amber-800' : 'text-slate-600'}
+                          >
+                            {note.text}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                ))}
               </div>
-            ))}
-            {totalWarnings > 0 && (
-              <p className="text-xs text-amber-700 pt-1">
-                {totalWarnings} archivo(s) no generaron filas — revisa que sean la nómina o el
-                Movimiento CC en el formato esperado.
-              </p>
-            )}
-          </div>
+
+              {renderConsolidationPanel('Consolidación de nóminas', nominaConsolidation)}
+              {renderConsolidationPanel('Consolidación de Movimiento CC', movimientoConsolidation)}
+              {renderConsolidationPanel('Consolidación de Facturación', facturacionConsolidation)}
+              {totalWarnings > 0 && (
+                <p className="text-xs text-amber-700">
+                  {totalWarnings} archivo(s) con avisos — revisa que sean la nómina, la
+                  facturación o el Movimiento CC en el formato esperado.
+                </p>
+              )}
+            </div>
+          </section>
         )}
 
-        {/* Tabla consolidada */}
-        {consolidatedRows.length > 0 && !loading && (
-          <div ref={resultsRef} className="space-y-6 scroll-mt-6">
-            <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
-              <div className="p-4 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-4">
-                <div className="flex items-center gap-2 text-emerald-600 text-xs font-semibold">
-                  <CheckCircle2 className="w-4 h-4" />
-                  <span>{filteredData.length} registros consolidados</span>
-                </div>
+        {/* Paso 3: resultado */}
+        {hasResults && !loading && (
+          <section
+            ref={resultsRef}
+            className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden scroll-mt-6"
+          >
+            <SectionHeader
+              step="3"
+              title="Resultado consolidado"
+              subtitle={`${filteredData.length} registros${
+                searchTerm.trim() ? ' que coinciden con la búsqueda' : ''
+              }`}
+            >
+              <button
+                onClick={downloadXLSX}
+                disabled={exporting}
+                className="flex items-center gap-1.5 px-3.5 py-2 bg-blue-900 hover:bg-blue-800 disabled:opacity-50 text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer"
+              >
+                <FileSpreadsheet className="w-4 h-4" />
+                {exporting ? 'Generando...' : 'Descargar Excel'}
+              </button>
+              <button
+                onClick={downloadCSV}
+                className="flex items-center gap-1.5 px-3.5 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-semibold text-xs rounded-lg transition-colors cursor-pointer"
+              >
+                <Download className="w-4 h-4" />
+                CSV
+              </button>
+              <button
+                onClick={downloadJSON}
+                className="flex items-center gap-1.5 px-3.5 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-semibold text-xs rounded-lg transition-colors cursor-pointer"
+              >
+                <Download className="w-4 h-4" />
+                JSON
+              </button>
+            </SectionHeader>
 
-                <div className="relative flex-1 max-w-xs">
-                  <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                  <input
-                    type="text"
-                    placeholder="Buscar empleado, concepto, mes, estado..."
-                    value={searchTerm}
-                    onChange={(e) => {
-                      setSearchTerm(e.target.value);
-                      setCurrentPage(1);
-                    }}
-                    className="w-full pl-9 pr-3 py-1.5 text-xs bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-500"
-                  />
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={downloadXLSX}
-                    disabled={exporting || filteredData.length === 0}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-900 hover:bg-blue-800 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium text-xs rounded-lg transition-colors cursor-pointer"
-                  >
-                    <FileSpreadsheet className="w-3.5 h-3.5" />
-                    {exporting ? 'Generando...' : 'Excel'}
-                  </button>
-                  <button
-                    onClick={downloadCSV}
-                    disabled={filteredData.length === 0}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium text-xs rounded-lg transition-colors cursor-pointer"
-                  >
-                    <FileSpreadsheet className="w-3.5 h-3.5" />
-                    CSV
-                  </button>
-                  <button
-                    onClick={downloadJSON}
-                    disabled={filteredData.length === 0}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium text-xs rounded-lg transition-colors cursor-pointer"
-                  >
-                    <Download className="w-3.5 h-3.5" />
-                    JSON
-                  </button>
-                </div>
+            {/* Búsqueda y leyenda */}
+            <div className="px-6 py-3 bg-slate-50 border-b border-slate-100 flex flex-wrap items-center justify-between gap-4">
+              <div className="relative w-full max-w-sm">
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder="Buscar empleado, concepto, mes..."
+                  value={searchTerm}
+                  onChange={(e) => {
+                    setSearchTerm(e.target.value);
+                    setCurrentPage(1);
+                  }}
+                  className="w-full pl-9 pr-3 py-2 text-xs bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+                />
               </div>
-
               {legendColors.length > 0 && (
-                <div className="px-4 py-2 bg-white border-b border-slate-200 flex flex-wrap items-center gap-4 text-xs text-slate-600">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-600">
                   {legendColors.map((hex) => (
                     <span key={hex} className="flex items-center gap-1.5">
                       <span
-                        className="inline-block w-3 h-3 rounded-sm"
+                        className="inline-block w-3 h-3 rounded-sm ring-1 ring-black/10"
                         style={{ backgroundColor: `#${hex}` }}
                       />
                       {STATUS_COLORS[hex]}
@@ -1217,69 +1306,90 @@ export default function App() {
                   ))}
                 </div>
               )}
+            </div>
 
-              <div className="overflow-x-auto max-h-[28rem]">
-                <table className="w-full text-left text-xs text-slate-700">
-                  <thead className="bg-slate-100 uppercase text-slate-500 sticky top-0 border-b border-slate-200 font-semibold">
-                    <tr>
-                      {tableColumns.map((col) => (
-                        <th
-                          key={col}
-                          className="px-5 py-3 whitespace-nowrap"
-                          style={{ minWidth: COLUMN_MIN_WIDTH[col] }}
-                        >
-                          {col}
-                        </th>
+            <div className="overflow-x-auto max-h-[28rem]">
+              <table className="w-full text-left text-xs text-slate-700">
+                <thead className="bg-slate-100 text-slate-600 sticky top-0 border-b border-slate-200 font-semibold">
+                  <tr>
+                    {OUTPUT_COLUMNS.map((col) => (
+                      <th
+                        key={col}
+                        className={`px-5 py-3 whitespace-nowrap ${
+                          VALUE_COLUMNS.has(col) ? 'text-right' : ''
+                        }`}
+                        style={{ minWidth: COLUMN_MIN_WIDTH[col] }}
+                      >
+                        {col}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {paginatedData.map((row, idx) => (
+                    <tr key={idx} className="hover:bg-slate-50 transition-colors">
+                      {OUTPUT_COLUMNS.map((col) => (
+                        <td key={col} className={cellClass(col)} style={cellStyle(row, col)}>
+                          {renderCell(row, col)}
+                        </td>
                       ))}
                     </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {paginatedData.map((row, idx) => (
-                      <tr key={idx} className="hover:bg-slate-50 transition-colors">
-                        {tableColumns.map((col) => (
-                          <td key={col} className={cellClass(col)} style={cellStyle(row, col)}>
-                            {renderCell(row, col)}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                  ))}
+                  {paginatedData.length === 0 && (
+                    <tr>
+                      <td
+                        colSpan={OUTPUT_COLUMNS.length}
+                        className="px-5 py-10 text-center text-slate-500"
+                      >
+                        Ningún registro coincide con "{searchTerm}". Prueba con otro término.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
 
-              <div className="p-3 bg-slate-50 border-t border-slate-200 flex items-center justify-between text-xs text-slate-600">
-                <span>
-                  Página {currentPage} de {totalPages}
-                </span>
-                <div className="flex items-center gap-1">
-                  <button
-                    disabled={currentPage === 1}
-                    onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
-                    className="p-1.5 rounded border border-slate-200 hover:bg-white disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
-                  >
-                    <ChevronLeft className="w-4 h-4" />
-                  </button>
-                  <button
-                    disabled={currentPage === totalPages}
-                    onClick={() => setCurrentPage((prev) => Math.min(prev + 1, totalPages))}
-                    className="p-1.5 rounded border border-slate-200 hover:bg-white disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
-                  >
-                    <ChevronRight className="w-4 h-4" />
-                  </button>
-                </div>
+            <div className="px-6 py-3 bg-slate-50 border-t border-slate-100 flex items-center justify-between text-xs text-slate-600">
+              <span>
+                Página {currentPage} de {totalPages}
+              </span>
+              <div className="flex items-center gap-1">
+                <button
+                  disabled={currentPage === 1}
+                  onClick={() => setCurrentPage((prev) => Math.max(prev - 1, 1))}
+                  className="p-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                  aria-label="Página anterior"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+                <button
+                  disabled={currentPage === totalPages}
+                  onClick={() => setCurrentPage((prev) => Math.min(prev + 1, totalPages))}
+                  className="p-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                  aria-label="Página siguiente"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
               </div>
             </div>
-          </div>
+          </section>
         )}
 
-        {files.length > 0 && consolidatedRows.length === 0 && !loading && (
-          <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-10 text-center space-y-2">
+        {hasFiles && !hasResults && !loading && (
+          <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-10 text-center space-y-3">
             <FileX2 className="w-8 h-8 text-slate-300 mx-auto" />
             <p className="text-sm font-semibold text-slate-700">Ningún archivo generó registros</p>
-            <p className="text-xs text-slate-500">
-              Revisa los avisos de arriba: probablemente el archivo no es la nómina ni el
-              Movimiento CC en el formato que la app reconoce.
+            <p className="text-xs text-slate-500 max-w-md mx-auto">
+              Revisa los avisos de arriba: probablemente el archivo no es la nómina, la facturación
+              ni el Movimiento CC en el formato que la app reconoce.
             </p>
+            <button
+              onClick={openFilePicker}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-blue-900 hover:bg-blue-800 text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer"
+            >
+              <Plus className="w-4 h-4" />
+              Nuevo archivo
+            </button>
           </div>
         )}
       </main>
