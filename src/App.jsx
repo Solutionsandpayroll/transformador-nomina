@@ -17,7 +17,8 @@ import {
   FileX2,
   Plus,
   Trash2,
-  FileText
+  FileText,
+  ArrowLeftRight
 } from 'lucide-react';
 import {
   convertNominaRows,
@@ -30,6 +31,7 @@ import {
   convertFacturacionRows,
   convertFacturacionFiles
 } from './facturacionConverter';
+import { cruzarNominaSiigo, CRUCE_LABEL, CRUCE_COLORS } from './cruceNominaSiigo';
 
 // ============================================================================
 // LECTOR DE .xlsx / .xlsm CON JSZIP (sin librería xlsx/SheetJS)
@@ -479,6 +481,7 @@ const EXCEL_COLUMN_WIDTH = {
   'Mes elaboración': 15,
   Concepto: 44,
   Empleado: 34,
+  Documento: 16,
   'Valor Concepto': 16,
   'Valor Totales': 16
 };
@@ -594,12 +597,12 @@ async function buildXlsxBlobWithJSZip(dataRows, columns) {
 // COMPONENTE PRINCIPAL
 // ============================================================================
 
-// Columnas de salida, en el orden y con los nombres exactos del ejemplo real
-// (Hoja2 de BUBBLE_-_Nómina_1.xlsm).
+// Columnas de salida (Documento = cédula, sirve para cruzar con Siigo).
 const OUTPUT_COLUMNS = [
   'Mes elaboración',
   'Concepto',
   'Empleado',
+  'Documento',
   'Valor Concepto',
   'Valor Totales'
 ];
@@ -609,9 +612,25 @@ const COLUMN_MIN_WIDTH = {
   'Mes elaboración': 150,
   Concepto: 300,
   Empleado: 280,
+  Documento: 140,
   'Valor Concepto': 170,
   'Valor Totales': 170
 };
+
+// Columnas de la tabla de cruce nómina vs Siigo.
+const CRUCE_COLUMNS = [
+  'Empresa',
+  'Mes',
+  'Documento',
+  'Empleado',
+  'Concepto',
+  'Valor Nómina',
+  'Valor Siigo',
+  'Diferencia',
+  'Estado'
+];
+const CRUCE_NUMERIC = new Set(['Valor Nómina', 'Valor Siigo', 'Diferencia']);
+const CRUCE_MAX_ROWS_ON_SCREEN = 500;
 
 // Etiqueta que se muestra junto al nombre del archivo, según qué formato se reconoció.
 const SOURCE_TYPE_LABEL = {
@@ -659,10 +678,17 @@ export default function App() {
   const [currentPage, setCurrentPage] = useState(1);
   const rowsPerPage = 10;
 
+  // Cruce nómina vs Siigo: empresa escrita por archivo, resultado y filtro de la tabla.
+  const [empresaByFile, setEmpresaByFile] = useState({});
+  const [soloDiferencias, setSoloDiferencias] = useState(true);
+  const [cruce, setCruce] = useState(null);
+  const [cruceError, setCruceError] = useState('');
+
   // Para bajar solos hasta el resultado cuando termina de procesar.
   const fileInputRef = useRef(null);
   const fileListRef = useRef(null);
   const resultsRef = useRef(null);
+  const cruceRef = useRef(null);
   const scrollPending = useRef(false);
 
   // Los archivos se leen una vez; la conversión se recalcula si cambia la opción de nombres.
@@ -672,14 +698,9 @@ export default function App() {
   );
 
   // Consolidación de varios archivos de una misma empresa bajo la misma casilla:
-  // varias nóminas anchas (p. ej. los 4 a 6 archivos mensuales de RemoFirst),
-  // varios Movimiento CC (p. ej. un archivo por rango de fechas) y/o varias
-  // facturaciones EOR (p. ej. una por mes). Es opcional porque los códigos de
-  // empleado / nombres de empresas distintas podrían repetirse y mezclar datos.
-  // Para el Movimiento CC, además, consolidar antes de convertir es lo que
-  // permite que la inferencia de empleado por fecha (en aportes patronales y en
-  // filas de salario sin Tercero) vea todas las filas de una misma fecha aunque
-  // hayan llegado en archivos distintos.
+  // varias nóminas anchas, varios Movimiento CC y/o varias facturaciones EOR.
+  // Es opcional porque los códigos de empleado / nombres de empresas distintas
+  // podrían repetirse y mezclar datos.
   const nominaConsolidation = useMemo(() => {
     if (!consolidateNomina) return null;
     const inputs = processed
@@ -729,6 +750,56 @@ export default function App() {
     for (const row of consolidatedRows) if (row._fill) used.add(row._fill);
     return Object.keys(STATUS_COLORS).filter((hex) => used.has(hex));
   }, [consolidatedRows]);
+
+  // ---------------------------------------------------------------------------
+  // Cruce nómina/facturación vs Siigo (se hace al presionar "Cruzar nómina")
+  // ---------------------------------------------------------------------------
+  const nominaFiles = useMemo(
+    () =>
+      processed.filter(
+        (f) => (f.sourceType === 'nomina' || f.sourceType === 'facturacion') && f.rows.length > 0
+      ),
+    [processed]
+  );
+  const siigoFiles = useMemo(
+    () => processed.filter((f) => f.sourceType === 'movimiento' && f.rows.length > 0),
+    [processed]
+  );
+  const canCruzar = nominaFiles.length > 0 && siigoFiles.length > 0;
+
+  const empresasKey = (list) =>
+    [...new Set(list.map((f) => (empresaByFile[f.fileId] || '').trim().toUpperCase()))]
+      .sort()
+      .join('|');
+  const empresasDiffieren = canCruzar && empresasKey(nominaFiles) !== empresasKey(siigoFiles);
+
+  // Si cambian los archivos o las empresas, el cruce anterior ya no sirve.
+  useEffect(() => {
+    setCruce(null);
+    setCruceError('');
+  }, [files, unifyNames, empresaByFile]);
+
+  useEffect(() => {
+    if (cruce) cruceRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [cruce]);
+
+  const handleCruzar = () => {
+    try {
+      const tag = (f) =>
+        f.rows.map((r) => ({ ...r, Empresa: (empresaByFile[f.fileId] || '').trim() }));
+      const result = cruzarNominaSiigo(nominaFiles.flatMap(tag), siigoFiles.flatMap(tag));
+      setSoloDiferencias(true);
+      setCruce(result);
+    } catch (err) {
+      console.error('Error en el cruce', err);
+      setCruceError('No se pudo hacer el cruce: ' + err.message);
+    }
+  };
+
+  const cruceRows = useMemo(() => {
+    if (!cruce) return [];
+    return soloDiferencias ? cruce.rows.filter((r) => r.Estado !== 'OK') : cruce.rows;
+  }, [cruce, soloDiferencias]);
 
   useEffect(() => {
     if (loading || !scrollPending.current) return;
@@ -789,11 +860,17 @@ export default function App() {
 
   const removeFile = useCallback((fileId) => {
     setFiles((prev) => prev.filter((f) => f.fileId !== fileId));
+    setEmpresaByFile((prev) => {
+      const next = { ...prev };
+      delete next[fileId];
+      return next;
+    });
     setCurrentPage(1);
   }, []);
 
   const clearAll = () => {
     setFiles([]);
+    setEmpresaByFile({});
     setSearchTerm('');
     setCurrentPage(1);
   };
@@ -871,6 +948,28 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  // CSV del cruce: respeta el filtro "solo lo que no cuadra" y trae todas las filas,
+  // no solo las que caben en pantalla. Los montos van como número plano.
+  const downloadCruceCSV = () => {
+    if (cruceRows.length === 0) return;
+    const quote = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const lines = cruceRows.map((row) =>
+      CRUCE_COLUMNS.map((col) => {
+        if (CRUCE_NUMERIC.has(col)) return String(row[col]);
+        if (col === 'Estado') return quote(CRUCE_LABEL[row.Estado]);
+        return quote(row[col]);
+      }).join(',')
+    );
+    const csvContent = [CRUCE_COLUMNS.join(','), ...lines].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'cruce_nomina_siigo.csv';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const totalWarnings = processed.filter((f) => f.warning).length;
   const hasFiles = files.length > 0;
   const hasResults = consolidatedRows.length > 0;
@@ -907,11 +1006,12 @@ export default function App() {
       </div>
     );
 
-  // Progreso de los tres pasos.
+  // Progreso de los pasos.
   const steps = [
     { label: 'Cargar archivos', done: hasFiles },
     { label: 'Revisar avisos', done: hasResults },
-    { label: 'Exportar', done: false }
+    { label: 'Exportar', done: false },
+    { label: 'Cruzar nómina', done: Boolean(cruce) }
   ];
   const activeStep = !hasFiles ? 0 : !hasResults ? 1 : 2;
 
@@ -946,11 +1046,13 @@ export default function App() {
             <p className="text-sm text-blue-100/80 leading-relaxed">
               Carga la nómina, la facturación EOR o el Movimiento CC de Siigo. La app reconoce
               sola cada formato y te devuelve una tabla lista para filtrar y cruzar la cuenta 28.
+              Si cargas la nómina y el Siigo juntos, con el botón "Cruzar nómina" los compara por
+              empleado y concepto.
             </p>
           </div>
 
           {/* Pasos */}
-          <ol className="flex items-center gap-2 text-xs font-medium">
+          <ol className="flex items-center gap-2 text-xs font-medium flex-wrap">
             {steps.map((s, i) => (
               <li key={s.label} className="flex items-center gap-2">
                 <span
@@ -1010,8 +1112,8 @@ export default function App() {
               <p>
                 <strong className="text-slate-900">2. Qué sale de la nómina:</strong> una fila por
                 mes, empleado y concepto, con los nombres de concepto tal como aparecen en el
-                encabezado de la nómina, y al final de cada empleado su TOTAL EMPLOYEE COST. Los
-                conceptos en cero no se listan.
+                encabezado de la nómina, la cédula del empleado (columna Documento) y, al final de
+                cada empleado, su TOTAL EMPLOYEE COST. Los conceptos en cero no se listan.
               </p>
               <p>
                 <strong className="text-slate-900">3. Qué sale de la facturación EOR:</strong> lo
@@ -1026,10 +1128,11 @@ export default function App() {
                 <strong className="text-slate-900">4. Qué sale del Movimiento CC:</strong> cada
                 Descripción se clasifica a un concepto tipo nómina (SALARY, PENSION COST, HEALTH
                 COST…) con la tabla CONCEPT_KEYWORDS, se suma por mes, concepto y empleado (Débito −
-                Crédito) y se agrega TOTAL EMPLOYEE COST por mes y empleado. Los aportes patronales,
-                y las filas de salario/prestación que vengan sin Tercero, se asignan al empleado del
-                mismo día (si hay un único candidato); si no se puede, salen como "(sin asignar)".
-                Lo que no se reconoce queda con el texto de Descripción y se avisa.
+                Crédito) y se agrega TOTAL EMPLOYEE COST por mes y empleado. El empleado y su cédula
+                salen de "Nombre tercero" e "Identificación tercero" en salarios, auxilios y gastos;
+                en los seguros de vida, de la Descripción. Los aportes patronales se asignan al
+                empleado del mismo día (si hay un único candidato); si no se puede, salen como
+                "(sin asignar)". Lo que no se reconoce queda con el texto de Descripción y se avisa.
               </p>
               <p>
                 <strong className="text-slate-900">5. Colores:</strong> son los que ya trae el
@@ -1046,6 +1149,18 @@ export default function App() {
               <p>
                 <strong className="text-slate-900">7. Exportar:</strong> descarga el resultado
                 consolidado en Excel (con los colores y el formato contable), CSV o JSON.
+              </p>
+              <p>
+                <strong className="text-slate-900">8. Cruzar nómina:</strong> si cargas al mismo
+                tiempo una nómina (o facturación EOR) y un Movimiento CC de Siigo, se activa el
+                botón "Cruzar nómina" del paso 4. Compara por empresa, mes, empleado y concepto. Al
+                empleado se le identifica por su cédula; si no hay, por el nombre, aunque las
+                palabras estén en distinto orden o el nombre venga incompleto. Si cruzas varias
+                empresas, escribe el mismo nombre en el campo "Empresa" de los archivos de nómina y
+                de Siigo que se corresponden; si es una sola empresa, déjalo vacío. Los auxilios se
+                comparan sumados, el seguro de vida de Siigo se compara contra HEALTH INSURANCE +
+                MEDICAL TEST de la nómina, y la prima, las cesantías y sus intereses se comparan
+                acumulados.
               </p>
             </div>
           )}
@@ -1284,7 +1399,7 @@ export default function App() {
                 <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
                 <input
                   type="text"
-                  placeholder="Buscar empleado, concepto, mes..."
+                  placeholder="Buscar empleado, cédula, concepto, mes..."
                   value={searchTerm}
                   onChange={(e) => {
                     setSearchTerm(e.target.value);
@@ -1372,6 +1487,221 @@ export default function App() {
                 </button>
               </div>
             </div>
+          </section>
+        )}
+
+        {/* Paso 4: cruzar nómina vs Siigo */}
+        {hasFiles && !loading && (
+          <section
+            ref={cruceRef}
+            className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden scroll-mt-6"
+          >
+            <SectionHeader
+              step="4"
+              title="Cruzar nómina vs Siigo"
+              subtitle="Compara por empresa, mes, empleado y concepto."
+            >
+              <button
+                onClick={handleCruzar}
+                disabled={!canCruzar}
+                className="flex items-center gap-1.5 px-4 py-2 bg-blue-900 hover:bg-blue-800 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer"
+              >
+                <ArrowLeftRight className="w-4 h-4" />
+                Cruzar nómina
+              </button>
+            </SectionHeader>
+
+            <div className="p-6 space-y-4">
+              {/* Qué falta para poder cruzar */}
+              <div className="flex flex-wrap gap-2 text-xs font-medium">
+                <span
+                  className={`px-3 py-1 rounded-full ring-1 ${
+                    nominaFiles.length
+                      ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
+                      : 'bg-slate-50 text-slate-500 ring-slate-200'
+                  }`}
+                >
+                  {nominaFiles.length ? '✓' : '○'} Nómina / facturación ({nominaFiles.length})
+                </span>
+                <span
+                  className={`px-3 py-1 rounded-full ring-1 ${
+                    siigoFiles.length
+                      ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
+                      : 'bg-slate-50 text-slate-500 ring-slate-200'
+                  }`}
+                >
+                  {siigoFiles.length ? '✓' : '○'} Movimiento CC de Siigo ({siigoFiles.length})
+                </span>
+              </div>
+
+              {!canCruzar && (
+                <p className="text-xs text-slate-500">
+                  Carga una nómina (o facturación) y un Movimiento CC de Siigo para activar el cruce.
+                </p>
+              )}
+
+              {/* Empresa por archivo */}
+              {canCruzar && (
+                <>
+                  <div className="grid md:grid-cols-2 gap-4">
+                    {[
+                      ['Nómina / facturación', nominaFiles],
+                      ['Siigo', siigoFiles]
+                    ].map(([title, list]) => (
+                      <div key={title} className="rounded-xl border border-slate-200 p-4 space-y-2">
+                        <p className="text-xs font-bold text-slate-700">{title}</p>
+                        {list.map((f) => (
+                          <div key={f.fileId} className="flex items-center gap-2">
+                            <span
+                              className="flex-1 min-w-0 truncate text-xs text-slate-600"
+                              title={f.fileName}
+                            >
+                              {f.fileName}
+                            </span>
+                            <input
+                              type="text"
+                              value={empresaByFile[f.fileId] || ''}
+                              onChange={(e) =>
+                                setEmpresaByFile((prev) => ({
+                                  ...prev,
+                                  [f.fileId]: e.target.value
+                                }))
+                              }
+                              placeholder="Empresa (opcional)"
+                              className="w-40 px-2.5 py-1.5 rounded-lg border border-slate-200 text-xs focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    Si es una sola empresa, deja "Empresa" vacío en todos. Si cruzas varias, escribe
+                    el mismo nombre en la nómina y en el Siigo que se corresponden.
+                  </p>
+                </>
+              )}
+
+              {empresasDiffieren && (
+                <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                  Los nombres de empresa de la nómina y del Siigo no coinciden: casi todo saldrá
+                  como "Solo en nómina / Solo en Siigo".
+                </p>
+              )}
+              {cruceError && <p className="text-xs text-red-700">{cruceError}</p>}
+            </div>
+
+            {/* Resultado del cruce */}
+            {cruce && (
+              <>
+                <div className="px-6 py-3 bg-slate-50 border-y border-slate-100 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-600">
+                    {['OK', 'DIFERENCIA', 'SOLO_NOMINA', 'SOLO_SIIGO', 'CRUZA_ENTRE_MESES'].map(
+                      (estado) => (
+                        <span key={estado} className="flex items-center gap-1.5">
+                          <span
+                            className="inline-block w-3 h-3 rounded-sm ring-1 ring-black/10"
+                            style={{ backgroundColor: `#${CRUCE_COLORS[estado]}` }}
+                          />
+                          {CRUCE_LABEL[estado]}: <strong>{cruce.summary[estado]}</strong>
+                        </span>
+                      )
+                    )}
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={soloDiferencias}
+                        onChange={(e) => setSoloDiferencias(e.target.checked)}
+                        className="accent-blue-900"
+                      />
+                      Solo lo que no cuadra
+                    </label>
+                    <button
+                      onClick={downloadCruceCSV}
+                      disabled={cruceRows.length === 0}
+                      className="flex items-center gap-1.5 px-3.5 py-2 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 text-slate-700 font-semibold text-xs rounded-lg cursor-pointer"
+                    >
+                      <Download className="w-4 h-4" />
+                      CSV del cruce
+                    </button>
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto max-h-[28rem]">
+                  <table className="w-full text-left text-xs text-slate-700">
+                    <thead className="bg-slate-100 text-slate-600 sticky top-0 border-b border-slate-200 font-semibold">
+                      <tr>
+                        {CRUCE_COLUMNS.map((col) => (
+                          <th
+                            key={col}
+                            className={`px-4 py-3 whitespace-nowrap ${
+                              CRUCE_NUMERIC.has(col) ? 'text-right' : ''
+                            }`}
+                          >
+                            {col}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {cruceRows.slice(0, CRUCE_MAX_ROWS_ON_SCREEN).map((row, idx) => (
+                        <tr key={idx} className="hover:bg-slate-50 transition-colors">
+                          {CRUCE_COLUMNS.map((col) => {
+                            if (col === 'Estado') {
+                              return (
+                                <td
+                                  key={col}
+                                  className="px-4 py-2 whitespace-nowrap font-medium"
+                                  style={{ backgroundColor: `#${CRUCE_COLORS[row.Estado]}` }}
+                                >
+                                  {CRUCE_LABEL[row.Estado]}
+                                </td>
+                              );
+                            }
+                            if (CRUCE_NUMERIC.has(col)) {
+                              return (
+                                <td
+                                  key={col}
+                                  className="px-4 py-2 text-right tabular-nums whitespace-nowrap"
+                                >
+                                  {row[col] === 0 ? '-' : row[col].toLocaleString('es-CO')}
+                                </td>
+                              );
+                            }
+                            return (
+                              <td key={col} className="px-4 py-2 whitespace-nowrap">
+                                {row[col]}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                      {cruceRows.length === 0 && (
+                        <tr>
+                          <td
+                            colSpan={CRUCE_COLUMNS.length}
+                            className="px-5 py-10 text-center text-slate-500"
+                          >
+                            {cruce.rows.length === 0
+                              ? 'No se encontraron conceptos para comparar entre los archivos cargados.'
+                              : 'Todo cuadra: no hay diferencias entre la nómina y el Siigo.'}
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                {cruceRows.length > CRUCE_MAX_ROWS_ON_SCREEN && (
+                  <p className="px-6 py-3 bg-slate-50 border-t border-slate-100 text-xs text-slate-500">
+                    Se muestran {CRUCE_MAX_ROWS_ON_SCREEN} de {cruceRows.length} filas; el CSV trae
+                    todas.
+                  </p>
+                )}
+              </>
+            )}
           </section>
         )}
 

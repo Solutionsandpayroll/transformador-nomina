@@ -388,9 +388,10 @@ export function convertFacturacionRows(rows, options = {}) {
     seenEmpMonth.set(empMonthKey, (seenEmpMonth.get(empMonthKey) || 0) + 1);
     if (seenEmpMonth.get(empMonthKey) === 2) duplicates += 1;
 
-    const extras = includeExtras
-      ? { Documento: e.code, Cliente: e.customer, "Tipo de servicio": e.service }
-      : {};
+   const extras = {
+  Documento: e.code,
+  ...(includeExtras ? { Cliente: e.customer, "Tipo de servicio": e.service } : {})
+};
 
     for (const o of out) {
       records.push({
