@@ -53,6 +53,11 @@ import { cruzarNominaSiigo, CRUCE_LABEL, CRUCE_COLORS } from './cruceNominaSiigo
 // número de serie de Excel, no como un objeto Date — quien la use (por
 // ejemplo convertMovimientoRows o convertFacturacionRows) debe decodificarla.
 
+// Busca etiquetas por su nombre local, con o sin prefijo (x:row, row...).
+// Algunos Excel (p. ej. el de Siigo) escriben el XML con prefijo y
+// getElementsByTagName('row') no los encontraría.
+const tagsOf = (node, name) => node.getElementsByTagNameNS('*', name);
+
 function colLettersToIndex(letters) {
   let result = 0;
   const upper = letters.toUpperCase();
@@ -69,10 +74,10 @@ function parseCellRef(ref) {
 }
 
 function parseSharedStrings(xmlDoc) {
-  const siNodes = xmlDoc.getElementsByTagName('si');
+  const siNodes = tagsOf(xmlDoc, 'si');
   const strings = [];
   for (let i = 0; i < siNodes.length; i++) {
-    const tNodes = siNodes[i].getElementsByTagName('t');
+    const tNodes = tagsOf(siNodes[i], 't');
     let text = '';
     for (let j = 0; j < tNodes.length; j++) {
       text += tNodes[j].textContent;
@@ -98,14 +103,14 @@ const INDEXED_COLORS = {
 // (cellXfs) o null si ese estilo no tiene relleno sólido.
 function parseStyleFills(xmlDoc) {
   const fillColors = [];
-  const fillsNode = xmlDoc.getElementsByTagName('fills')[0];
+  const fillsNode = tagsOf(xmlDoc, 'fills')[0];
   if (fillsNode) {
-    const fillNodes = fillsNode.getElementsByTagName('fill');
+    const fillNodes = tagsOf(fillsNode, 'fill');
     for (let i = 0; i < fillNodes.length; i++) {
-      const pattern = fillNodes[i].getElementsByTagName('patternFill')[0];
+      const pattern = tagsOf(fillNodes[i], 'patternFill')[0];
       let color = null;
       if (pattern && pattern.getAttribute('patternType') === 'solid') {
-        const fg = pattern.getElementsByTagName('fgColor')[0];
+        const fg = tagsOf(pattern, 'fgColor')[0];
         if (fg) {
           const rgb = fg.getAttribute('rgb');
           const indexed = fg.getAttribute('indexed');
@@ -120,9 +125,9 @@ function parseStyleFills(xmlDoc) {
   }
 
   const styleFills = [];
-  const xfsNode = xmlDoc.getElementsByTagName('cellXfs')[0];
+  const xfsNode = tagsOf(xmlDoc, 'cellXfs')[0];
   if (xfsNode) {
-    const xfNodes = xfsNode.getElementsByTagName('xf');
+    const xfNodes = tagsOf(xfsNode, 'xf');
     for (let i = 0; i < xfNodes.length; i++) {
       const fillId = Number(xfNodes[i].getAttribute('fillId') || 0);
       styleFills.push(fillColors[fillId] ?? null);
@@ -132,7 +137,7 @@ function parseStyleFills(xmlDoc) {
 }
 
 function parseWorkbookSheetList(xmlDoc) {
-  const sheetNodes = xmlDoc.getElementsByTagName('sheet');
+  const sheetNodes = tagsOf(xmlDoc, 'sheet');
   const sheets = [];
   for (let i = 0; i < sheetNodes.length; i++) {
     const node = sheetNodes[i];
@@ -150,7 +155,7 @@ function parseWorkbookSheetList(xmlDoc) {
 }
 
 function parseWorkbookRels(xmlDoc) {
-  const relNodes = xmlDoc.getElementsByTagName('Relationship');
+  const relNodes = tagsOf(xmlDoc, 'Relationship');
   const map = {};
   for (let i = 0; i < relNodes.length; i++) {
     const node = relNodes[i];
@@ -167,7 +172,7 @@ function resolveWorksheetPath(target) {
 }
 
 function parseSheetXmlToRows(xmlDoc, sharedStrings, styleFills) {
-  const rowNodes = xmlDoc.getElementsByTagName('row');
+  const rowNodes = tagsOf(xmlDoc, 'row');
   const rows = [];
 
   for (let i = 0; i < rowNodes.length; i++) {
@@ -175,7 +180,7 @@ function parseSheetXmlToRows(xmlDoc, sharedStrings, styleFills) {
     const rowNumAttr = rowNode.getAttribute('r');
     const rowIndex = rowNumAttr ? parseInt(rowNumAttr, 10) - 1 : i;
 
-    const cellNodes = rowNode.getElementsByTagName('c');
+    const cellNodes = tagsOf(rowNode, 'c');
     const rowArray = [];
 
     for (let j = 0; j < cellNodes.length; j++) {
@@ -190,15 +195,15 @@ function parseSheetXmlToRows(xmlDoc, sharedStrings, styleFills) {
       let value = null;
 
       if (type === 'inlineStr') {
-        const isNode = cellNode.getElementsByTagName('is')[0];
+        const isNode = tagsOf(cellNode, 'is')[0];
         if (isNode) {
-          const tNodes = isNode.getElementsByTagName('t');
+          const tNodes = tagsOf(isNode, 't');
           let text = '';
           for (let k = 0; k < tNodes.length; k++) text += tNodes[k].textContent;
           value = text;
         }
       } else {
-        const vNode = cellNode.getElementsByTagName('v')[0];
+        const vNode = tagsOf(cellNode, 'v')[0];
         const rawText = vNode ? vNode.textContent : null;
 
         if (rawText === null || rawText === '') {
@@ -245,14 +250,14 @@ async function readWorkbookSheetsWithJSZip(file) {
     throw new Error('El archivo no parece ser un .xlsx/.xlsm válido (falta xl/workbook.xml).');
   }
   const workbookXmlText = await workbookXmlFile.async('text');
-  const workbookXmlDoc = parser.parseFromString(workbookXmlText, 'text/xml');
+  const workbookXmlDoc = parser.parseFromString(workbookXmlText.replace(/^\uFEFF/, ''), 'text/xml');
   const sheetList = parseWorkbookSheetList(workbookXmlDoc);
 
   const relsFile = zip.file('xl/_rels/workbook.xml.rels');
   let relsMap = {};
   if (relsFile) {
     const relsXmlText = await relsFile.async('text');
-    const relsXmlDoc = parser.parseFromString(relsXmlText, 'text/xml');
+    const relsXmlDoc = parser.parseFromString(relsXmlText.replace(/^\uFEFF/, ''), 'text/xml');
     relsMap = parseWorkbookRels(relsXmlDoc);
   }
 
@@ -260,7 +265,7 @@ async function readWorkbookSheetsWithJSZip(file) {
   const sharedStringsFile = zip.file('xl/sharedStrings.xml');
   if (sharedStringsFile) {
     const sharedXmlText = await sharedStringsFile.async('text');
-    const sharedXmlDoc = parser.parseFromString(sharedXmlText, 'text/xml');
+    const sharedXmlDoc = parser.parseFromString(sharedXmlText.replace(/^\uFEFF/, ''), 'text/xml');
     sharedStrings = parseSharedStrings(sharedXmlDoc);
   }
 
@@ -268,7 +273,7 @@ async function readWorkbookSheetsWithJSZip(file) {
   const stylesFile = zip.file('xl/styles.xml');
   if (stylesFile) {
     const stylesXmlText = await stylesFile.async('text');
-    const stylesXmlDoc = parser.parseFromString(stylesXmlText, 'text/xml');
+    const stylesXmlDoc = parser.parseFromString(stylesXmlText.replace(/^\uFEFF/, ''), 'text/xml');
     styleFills = parseStyleFills(stylesXmlDoc);
   }
 
@@ -281,7 +286,7 @@ async function readWorkbookSheetsWithJSZip(file) {
     if (!sheetFile) continue;
 
     const sheetXmlText = await sheetFile.async('text');
-    const sheetXmlDoc = parser.parseFromString(sheetXmlText, 'text/xml');
+    const sheetXmlDoc = parser.parseFromString(sheetXmlText.replace(/^\uFEFF/, ''), 'text/xml');
     const rows = parseSheetXmlToRows(sheetXmlDoc, sharedStrings, styleFills);
     sheets.push({ name, rows });
   }
