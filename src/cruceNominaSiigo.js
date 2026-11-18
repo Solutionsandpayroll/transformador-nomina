@@ -29,6 +29,13 @@ const ACCUMULATED = new Set(['13TH SALARY', '14TH SALARY', 'INTEREST ON 14TH SAL
 
 const TOTAL = 'TOTAL EMPLOYEE COST';
 
+// Tolerancia del cruce: una diferencia pequeña se da por buena ("cruza").
+// Es un PORCENTAJE del valor más grande de los dos lados (1 = 1 %). Cámbialo aquí,
+// o pásalo como options.tolerancePct al llamar cruzarNominaSiigo.
+// Además siempre se aceptan diferencias de hasta options.tolerance pesos (1 por defecto)
+// para absorber redondeos.
+export const TOLERANCIA_PORCENTAJE = 1;
+
 function norm(v) {
   return String(v ?? '')
     .normalize('NFD')
@@ -77,6 +84,15 @@ function monthKey(d) {
 
 export function cruzarNominaSiigo(nominaRecords = [], siigoRecords = [], options = {}) {
   const tol = Number.isFinite(options.tolerance) ? options.tolerance : 1;
+  const pct = Number.isFinite(options.tolerancePct) ? options.tolerancePct : TOLERANCIA_PORCENTAJE;
+
+  // ¿La diferencia entre los dos valores está dentro de la tolerancia?
+  const within = (a, b) =>
+    Math.abs(a - b) <= Math.max(tol, (Math.max(Math.abs(a), Math.abs(b)) * pct) / 100);
+
+  // Las facturas (crédito EO Third parties) se cruzan aparte, contra la suma de TOTAL EMPLOYEE COST.
+  const facturas = siigoRecords.filter((r) => r.Tipo === 'FACTURA');
+  siigoRecords = siigoRecords.filter((r) => r.Tipo !== 'FACTURA');
 
   // nombre canónico -> documento (primero lo que dice la nómina, luego Siigo)
   const docByName = new Map();
@@ -152,8 +168,8 @@ export function cruzarNominaSiigo(nominaRecords = [], siigoRecords = [], options
 
       const dif = round2(vN - vS);
       let estado;
-      if (Math.abs(dif) <= tol) {
-        estado = acc && Math.abs(c.n - c.s) > tol ? 'CRUZA_ENTRE_MESES' : 'OK';
+      if (within(vN, vS)) {
+        estado = acc && !within(c.n, c.s) ? 'CRUZA_ENTRE_MESES' : 'OK';
       } else if (c.hasN && !c.hasS && !acc) estado = 'SOLO_NOMINA';
       else if (!c.hasN && c.hasS && !acc) estado = 'SOLO_SIIGO';
       else estado = 'DIFERENCIA';
@@ -170,6 +186,62 @@ export function cruzarNominaSiigo(nominaRecords = [], siigoRecords = [], options
         Diferencia: dif,
         Estado: estado,
         Acumulado: acc,
+        Tolerado: estado === 'OK' && Math.abs(dif) > tol, // cuadra, pero con una diferencia pequeña
+        _fill: CRUCE_COLORS[estado]
+      });
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // FACTURA del mes (Siigo) vs suma de TOTAL EMPLOYEE COST de las nóminas del mes.
+  // Solo se hace si el Siigo trae facturas; así no salen filas de más cuando el
+  // Movimiento CC no incluye la facturación.
+  // --------------------------------------------------------------------------
+  if (facturas.length > 0) {
+    const slots = new Map(); // empresa|mes -> { empresa, mes, n, f, hasN, hasF }
+    const slotOf = (r) => {
+      const mes = monthKey(r['Mes elaboración']);
+      if (!mes) return null;
+      const k = `${norm(r.Empresa)}|${mes}`;
+      if (!slots.has(k)) slots.set(k, { empresa: r.Empresa || '', mes, n: 0, f: 0, hasN: false, hasF: false });
+      return slots.get(k);
+    };
+
+    for (const r of facturas) {
+      const s = slotOf(r);
+      if (!s) continue;
+      s.f = round2(s.f + (Number(r['Valor Totales']) || 0));
+      s.hasF = true;
+    }
+    for (const r of nominaRecords) {
+      if (norm(r.Concepto) !== TOTAL) continue;
+      const s = slotOf(r);
+      if (!s) continue;
+      s.n = round2(s.n + (Number(r['Valor Totales']) || 0));
+      s.hasN = true;
+    }
+
+    for (const s of slots.values()) {
+      if (s.n === 0 && s.f === 0) continue;
+      const dif = round2(s.n - s.f);
+      let estado;
+      if (within(s.n, s.f)) estado = 'OK';
+      else if (s.hasN && !s.hasF) estado = 'SOLO_NOMINA';
+      else if (!s.hasN && s.hasF) estado = 'SOLO_SIIGO';
+      else estado = 'DIFERENCIA';
+
+      rows.push({
+        Empresa: s.empresa,
+        Mes: s.mes,
+        Documento: '',
+        Empleado: '(Factura del mes vs suma de nóminas)',
+        Concepto: 'FACTURA vs TOTAL EMPLOYEE COST',
+        'Valor Nómina': s.n,
+        'Valor Siigo': s.f,
+        Diferencia: dif,
+        Estado: estado,
+        Acumulado: false,
+        Tolerado: estado === 'OK' && Math.abs(dif) > tol,
         _fill: CRUCE_COLORS[estado]
       });
     }

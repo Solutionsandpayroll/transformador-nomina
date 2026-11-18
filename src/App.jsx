@@ -32,6 +32,8 @@ import {
   convertFacturacionFiles
 } from './facturacionConverter';
 import { cruzarNominaSiigo, CRUCE_LABEL, CRUCE_COLORS } from './cruceNominaSiigo';
+// OJO: este módulo también exporta CRUCE_COLORS, por eso se importa con otro nombre.
+import { cruzarTotalCostConFactura, CRUCE_COLORS as TC_COLORS } from './cruceTotalCostFactura';
 
 // ============================================================================
 // LECTOR DE .xlsx / .xlsm CON JSZIP (sin librería xlsx/SheetJS)
@@ -637,6 +639,34 @@ const CRUCE_COLUMNS = [
 const CRUCE_NUMERIC = new Set(['Valor Nómina', 'Valor Siigo', 'Diferencia']);
 const CRUCE_MAX_ROWS_ON_SCREEN = 500;
 
+// Columnas del cruce Total Employee Cost (facturación) vs EO Third parties (Siigo).
+const TC_SUMMARY_COLUMNS = [
+  'Periodo',
+  'Total Employee Cost (nómina)',
+  'EO Third parties (Siigo)',
+  'Diferencia',
+  'Estado',
+  'Empleados',
+  'Archivos de nómina',
+  'Facturas'
+];
+const TC_DETAIL_COLUMNS = [
+  'Periodo',
+  'Archivo de nómina',
+  'Total Employee Cost (nómina)',
+  'EO Third parties (Siigo)',
+  'Diferencia',
+  'Estado',
+  'Facturas'
+];
+const TC_NUMERIC = new Set([
+  'Total Employee Cost (nómina)',
+  'EO Third parties (Siigo)',
+  'Diferencia',
+  'Empleados'
+]);
+const TC_MAX_ROWS_ON_SCREEN = 500;
+
 // Etiqueta que se muestra junto al nombre del archivo, según qué formato se reconoció.
 const SOURCE_TYPE_LABEL = {
   nomina: 'Nómina',
@@ -689,11 +719,18 @@ export default function App() {
   const [cruce, setCruce] = useState(null);
   const [cruceError, setCruceError] = useState('');
 
+  // Cruce Total Employee Cost (facturación) vs EO Third parties (Siigo).
+  const [totalCost, setTotalCost] = useState(null);
+  const [totalCostError, setTotalCostError] = useState('');
+  const [totalCostTolerance, setTotalCostTolerance] = useState(10000);
+  const [soloProblemasTC, setSoloProblemasTC] = useState(true);
+
   // Para bajar solos hasta el resultado cuando termina de procesar.
   const fileInputRef = useRef(null);
   const fileListRef = useRef(null);
   const resultsRef = useRef(null);
   const cruceRef = useRef(null);
+  const totalCostRef = useRef(null);
   const scrollPending = useRef(false);
 
   // Los archivos se leen una vez; la conversión se recalcula si cambia la opción de nombres.
@@ -805,6 +842,65 @@ export default function App() {
     if (!cruce) return [];
     return soloDiferencias ? cruce.rows.filter((r) => r.Estado !== 'OK') : cruce.rows;
   }, [cruce, soloDiferencias]);
+
+  // ---------------------------------------------------------------------------
+  // Cruce Total Employee Cost (facturación EOR) vs EO Third parties (Siigo)
+  // Usa las filas crudas { v, f } de cada hoja, no las filas en formato largo:
+  // el módulo lee por su cuenta TOTAL EMPLOYEE COST y las descripciones de factura.
+  // ---------------------------------------------------------------------------
+  const facturaInputs = useMemo(
+    () =>
+      processed
+        .filter((f) => f.sourceType === 'facturacion' && f.facturacionRows)
+        .map((f) => ({ name: f.fileName, rows: f.facturacionRows })),
+    [processed]
+  );
+  const movimientoInputs = useMemo(
+    () =>
+      processed
+        .filter((f) => f.sourceType === 'movimiento' && f.movimientoRows)
+        .map((f) => ({ name: f.fileName, rows: f.movimientoRows })),
+    [processed]
+  );
+  const canCruzarTotalCost = facturaInputs.length > 0 && movimientoInputs.length > 0;
+
+  // Si cambian los archivos o la tolerancia, el resultado anterior ya no sirve.
+  useEffect(() => {
+    setTotalCost(null);
+    setTotalCostError('');
+  }, [files, totalCostTolerance]);
+
+  useEffect(() => {
+    if (totalCost) totalCostRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [totalCost]);
+
+  const handleCruzarTotalCost = () => {
+    try {
+      const result = cruzarTotalCostConFactura(facturaInputs, movimientoInputs, {
+        tolerance: Number(totalCostTolerance) || 0
+      });
+      if (!result) {
+        setTotalCost(null);
+        setTotalCostError(
+          'No se encontró nada para cruzar: ni TOTAL EMPLOYEE COST en la facturación ni facturas "EO Third parties" en el Siigo.'
+        );
+        return;
+      }
+      setTotalCostError('');
+      setSoloProblemasTC(true);
+      setTotalCost(result);
+    } catch (err) {
+      console.error('Error en el cruce Total Cost', err);
+      setTotalCostError('No se pudo hacer el cruce: ' + err.message);
+    }
+  };
+
+  const totalCostDetail = useMemo(() => {
+    if (!totalCost) return [];
+    return soloProblemasTC
+      ? totalCost.detail.filter((r) => r.Estado !== 'Cruce ok')
+      : totalCost.detail;
+  }, [totalCost, soloProblemasTC]);
 
   useEffect(() => {
     if (loading || !scrollPending.current) return;
@@ -975,6 +1071,25 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  // CSV del cruce Total Cost (detalle archivo de nómina vs factura), respetando el filtro.
+  const downloadTotalCostCSV = () => {
+    if (totalCostDetail.length === 0) return;
+    const quote = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const lines = totalCostDetail.map((row) =>
+      TC_DETAIL_COLUMNS.map((col) =>
+        TC_NUMERIC.has(col) ? String(row[col]) : quote(row[col])
+      ).join(',')
+    );
+    const csvContent = [TC_DETAIL_COLUMNS.join(','), ...lines].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'cruce_total_cost_factura.csv';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const totalWarnings = processed.filter((f) => f.warning).length;
   const hasFiles = files.length > 0;
   const hasResults = consolidatedRows.length > 0;
@@ -1016,7 +1131,8 @@ export default function App() {
     { label: 'Cargar archivos', done: hasFiles },
     { label: 'Revisar avisos', done: hasResults },
     { label: 'Exportar', done: false },
-    { label: 'Cruzar nómina', done: Boolean(cruce) }
+    { label: 'Cruzar nómina', done: Boolean(cruce) },
+    { label: 'Total Cost', done: Boolean(totalCost) }
   ];
   const activeStep = !hasFiles ? 0 : !hasResults ? 1 : 2;
 
@@ -1052,7 +1168,8 @@ export default function App() {
               Carga la nómina, la facturación EOR o el Movimiento CC de Siigo. La app reconoce
               sola cada formato y te devuelve una tabla lista para filtrar y cruzar la cuenta 28.
               Si cargas la nómina y el Siigo juntos, con el botón "Cruzar nómina" los compara por
-              empleado y concepto.
+              empleado y concepto, y con "Cruzar Total Cost" compara el total de la facturación
+              contra las facturas EO Third parties.
             </p>
           </div>
 
@@ -1166,6 +1283,18 @@ export default function App() {
                 comparan sumados, el seguro de vida de Siigo se compara contra HEALTH INSURANCE +
                 MEDICAL TEST de la nómina, y la prima, las cesantías y sus intereses se comparan
                 acumulados.
+              </p>
+              <p>
+                <strong className="text-slate-900">9. Cruzar Total Cost:</strong> con una
+                facturación EOR (hoja INVOICING) y un Movimiento CC de Siigo cargados, el paso 5
+                suma el TOTAL EMPLOYEE COST por periodo (mes y tipo: mensual u offcycle) y lo
+                compara con las facturas "EO Third parties" del Siigo. El periodo de la factura
+                sale del texto de la descripción ("..., June", "..., Offcycle June"), no de su
+                fecha. Cruza si la diferencia está dentro de la tolerancia (10.000 por defecto);
+                si una nómina cuadra con la suma de dos facturas, también la cruza. Si faltan
+                archivos de nómina de un mes, las facturas correspondientes quedan en amarillo. El
+                Excel de nómina debe venir calculado: si TOTAL EMPLOYEE COST no tiene valor, abre
+                y guarda el archivo en Excel antes de subirlo.
               </p>
             </div>
           )}
@@ -1703,6 +1832,217 @@ export default function App() {
                   <p className="px-6 py-3 bg-slate-50 border-t border-slate-100 text-xs text-slate-500">
                     Se muestran {CRUCE_MAX_ROWS_ON_SCREEN} de {cruceRows.length} filas; el CSV trae
                     todas.
+                  </p>
+                )}
+              </>
+            )}
+          </section>
+        )}
+
+        {/* Paso 5: Total Employee Cost vs facturas EO Third parties de Siigo */}
+        {hasFiles && !loading && (
+          <section
+            ref={totalCostRef}
+            className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden scroll-mt-6"
+          >
+            <SectionHeader
+              step="5"
+              title="Cruzar Total Cost vs factura"
+              subtitle="Compara el TOTAL EMPLOYEE COST de la facturación con las facturas EO Third parties del Siigo, por periodo."
+            >
+              <label className="flex items-center gap-2 text-xs text-slate-700">
+                Tolerancia
+                <input
+                  type="number"
+                  min="0"
+                  value={totalCostTolerance}
+                  onChange={(e) => setTotalCostTolerance(e.target.value)}
+                  className="w-24 px-2.5 py-1.5 rounded-lg border border-slate-200 text-xs focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+                />
+              </label>
+              <button
+                onClick={handleCruzarTotalCost}
+                disabled={!canCruzarTotalCost}
+                className="flex items-center gap-1.5 px-4 py-2 bg-blue-900 hover:bg-blue-800 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer"
+              >
+                <ArrowLeftRight className="w-4 h-4" />
+                Cruzar Total Cost
+              </button>
+            </SectionHeader>
+
+            <div className="p-6 space-y-3">
+              <div className="flex flex-wrap gap-2 text-xs font-medium">
+                <span
+                  className={`px-3 py-1 rounded-full ring-1 ${
+                    facturaInputs.length
+                      ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
+                      : 'bg-slate-50 text-slate-500 ring-slate-200'
+                  }`}
+                >
+                  {facturaInputs.length ? '✓' : '○'} Facturación EOR ({facturaInputs.length})
+                </span>
+                <span
+                  className={`px-3 py-1 rounded-full ring-1 ${
+                    movimientoInputs.length
+                      ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
+                      : 'bg-slate-50 text-slate-500 ring-slate-200'
+                  }`}
+                >
+                  {movimientoInputs.length ? '✓' : '○'} Movimiento CC de Siigo (
+                  {movimientoInputs.length})
+                </span>
+              </div>
+
+              {!canCruzarTotalCost && (
+                <p className="text-xs text-slate-500">
+                  Carga al menos una facturación EOR (hoja INVOICING) y un Movimiento CC de Siigo
+                  para activar este cruce.
+                </p>
+              )}
+              {totalCostError && <p className="text-xs text-red-700">{totalCostError}</p>}
+              {totalCost && totalCost.notes.length > 0 && (
+                <ul className="pl-4 space-y-1 list-disc text-xs">
+                  {totalCost.notes.map((n, i) => (
+                    <li key={i} className={n.type === 'warn' ? 'text-amber-800' : 'text-slate-600'}>
+                      {n.text}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            {totalCost && (
+              <>
+                {/* Resumen por periodo */}
+                <div className="overflow-x-auto border-t border-slate-100">
+                  <table className="w-full text-left text-xs text-slate-700">
+                    <thead className="bg-slate-100 text-slate-600 font-semibold border-b border-slate-200">
+                      <tr>
+                        {TC_SUMMARY_COLUMNS.map((col) => (
+                          <th
+                            key={col}
+                            className={`px-4 py-3 whitespace-nowrap ${
+                              TC_NUMERIC.has(col) ? 'text-right' : ''
+                            }`}
+                          >
+                            {col}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {totalCost.rows.map((row, idx) => (
+                        <tr key={idx}>
+                          {TC_SUMMARY_COLUMNS.map((col) => (
+                            <td
+                              key={col}
+                              className={`px-4 py-2 whitespace-nowrap ${
+                                TC_NUMERIC.has(col) ? 'text-right tabular-nums' : ''
+                              }`}
+                              style={
+                                col === 'Estado' ? { backgroundColor: `#${row._fill}` } : undefined
+                              }
+                            >
+                              {TC_NUMERIC.has(col) && row[col] === 0
+                                ? '-'
+                                : formatCellValue(row[col])}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Detalle: archivo de nómina vs factura */}
+                <div className="px-6 py-3 bg-slate-50 border-y border-slate-100 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-600">
+                    {[
+                      [TC_COLORS.ok, 'Cruce ok'],
+                      [TC_COLORS.diff, 'Diferencias'],
+                      [TC_COLORS.missing, 'No está en el otro lado']
+                    ].map(([hex, label]) => (
+                      <span key={label} className="flex items-center gap-1.5">
+                        <span
+                          className="inline-block w-3 h-3 rounded-sm ring-1 ring-black/10"
+                          style={{ backgroundColor: `#${hex}` }}
+                        />
+                        {label}
+                      </span>
+                    ))}
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={soloProblemasTC}
+                        onChange={(e) => setSoloProblemasTC(e.target.checked)}
+                        className="accent-blue-900"
+                      />
+                      Solo lo que no cuadra
+                    </label>
+                    <button
+                      onClick={downloadTotalCostCSV}
+                      disabled={totalCostDetail.length === 0}
+                      className="flex items-center gap-1.5 px-3.5 py-2 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 text-slate-700 font-semibold text-xs rounded-lg cursor-pointer"
+                    >
+                      <Download className="w-4 h-4" />
+                      CSV del detalle
+                    </button>
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto max-h-[28rem]">
+                  <table className="w-full text-left text-xs text-slate-700">
+                    <thead className="bg-slate-100 text-slate-600 sticky top-0 border-b border-slate-200 font-semibold">
+                      <tr>
+                        {TC_DETAIL_COLUMNS.map((col) => (
+                          <th
+                            key={col}
+                            className={`px-4 py-3 whitespace-nowrap ${
+                              TC_NUMERIC.has(col) ? 'text-right' : ''
+                            }`}
+                          >
+                            {col}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {totalCostDetail.slice(0, TC_MAX_ROWS_ON_SCREEN).map((row, idx) => (
+                        <tr key={idx} style={{ backgroundColor: `#${row._fill}` }}>
+                          {TC_DETAIL_COLUMNS.map((col) => (
+                            <td
+                              key={col}
+                              className={`px-4 py-2 whitespace-nowrap ${
+                                TC_NUMERIC.has(col) ? 'text-right tabular-nums' : ''
+                              }`}
+                            >
+                              {TC_NUMERIC.has(col) && row[col] === 0
+                                ? '-'
+                                : formatCellValue(row[col])}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                      {totalCostDetail.length === 0 && (
+                        <tr>
+                          <td
+                            colSpan={TC_DETAIL_COLUMNS.length}
+                            className="px-5 py-10 text-center text-slate-500"
+                          >
+                            Todo cruza dentro de la tolerancia.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                {totalCostDetail.length > TC_MAX_ROWS_ON_SCREEN && (
+                  <p className="px-6 py-3 bg-slate-50 border-t border-slate-100 text-xs text-slate-500">
+                    Se muestran {TC_MAX_ROWS_ON_SCREEN} de {totalCostDetail.length} filas; el CSV
+                    trae todas.
                   </p>
                 )}
               </>

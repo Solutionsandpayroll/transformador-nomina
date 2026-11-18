@@ -679,12 +679,21 @@ export function convertNominaFiles(files, options = {}) {
 //                 se asignan al empleado de la misma fecha
 //   "seguro"   -> seguros de vida: el Tercero es la aseguradora; el empleado
 //                 viene al final de la Descripción ("Seguros de vida - Ramon Cardona")
-//   "excluir"  -> facturación / ingresos, no es costo de un empleado
+//   "factura"  -> facturación / ingresos (crédito): se suma por mes y se cruza
+//                 contra el TOTAL EMPLOYEE COST de las nóminas
+//   "excluir"  -> filas que se ignoran por completo
 // El orden importa: gana la primera palabra clave que coincida.
 
+// Facturación (crédito de "EO Third parties" / "Ingresos recibidos para terceros"):
+// no es costo de un empleado, pero debe cruzar contra la suma de los
+// TOTAL EMPLOYEE COST de las nóminas del mes. Sale como un registro por mes con
+// Tipo = "FACTURA"; el cruce (cruceNominaSiigo.js) lo compara con las nóminas.
+export const FACTURA_CONCEPT = "FACTURA (EO Third parties)";
+const FACTURA_EMPLOYEE = "(Facturación del mes)";
+
 export const CONCEPT_KEYWORDS = [
-  { keyword: "EO THIRD PARTIES", concepto: null, group: "excluir" },
-  { keyword: "INGRESOS RECIBIDOS", concepto: null, group: "excluir" },
+  { keyword: "EO THIRD PARTIES", concepto: FACTURA_CONCEPT, group: "factura" },
+  { keyword: "INGRESOS RECIBIDOS", concepto: FACTURA_CONCEPT, group: "factura" },
 
   { keyword: "001050 - SALARIO", concepto: "SALARY", group: "empleado" },
   { keyword: "SALARIO", concepto: "SALARY", group: "empleado" },
@@ -862,6 +871,8 @@ export function convertMovimientoRows(rows, options = {}) {
   const unknownFills = new Map();
 
   let excludedRows = 0;
+  const facturaByMonth = new Map(); // mes -> crédito - débito de la facturación
+  let facturaCount = 0;
   let skippedNoDate = 0;
   let dataRows = 0;
   let unclassifiedCount = 0;
@@ -915,6 +926,14 @@ export function convertMovimientoRows(rows, options = {}) {
 
     const descripcionNorm = norm(descripcionVal);
     const match = matchConceptWith(descripcionNorm);
+
+    if (match && match.group === "factura") {
+      // value = débito - crédito; la factura es un crédito, así que se invierte el signo.
+      const mk = monthKey(monthDate);
+      facturaByMonth.set(mk, round2((facturaByMonth.get(mk) || 0) - value));
+      facturaCount += 1;
+      continue;
+    }
 
     if (match && match.group === "excluir") {
       excludedRows += 1;
@@ -978,7 +997,7 @@ export function convertMovimientoRows(rows, options = {}) {
     });
   }
 
-  if (!header || dataRows === 0) return null;
+  if (!header || (dataRows === 0 && facturaCount === 0)) return null;
 
   // --------------------------------------------------------------------------
   // PASADA 2: asignar empleado (nombres incompletos y aportes patronales)
@@ -1100,6 +1119,23 @@ export function convertMovimientoRows(rows, options = {}) {
     });
   }
 
+  // ---- FACTURACIÓN del mes (para cruzar contra la suma de TOTAL EMPLOYEE COST) ----
+  for (const [mKey, total] of facturaByMonth) {
+    if (total === 0) continue;
+    const [y, m] = mKey.split("-").map(Number);
+
+    records.push({
+      "Mes elaboración": new Date(Date.UTC(y, m - 1, 1)),
+      Concepto: FACTURA_CONCEPT,
+      Empleado: FACTURA_EMPLOYEE,
+      Documento: "",
+      "Valor Concepto": 0,
+      "Valor Totales": total,
+      _fill: null,
+      Tipo: "FACTURA"
+    });
+  }
+
   // --------------------------------------------------------------------------
   // ORDEN
   // --------------------------------------------------------------------------
@@ -1147,7 +1183,14 @@ export function convertMovimientoRows(rows, options = {}) {
   if (excludedRows > 0) {
     notes.push({
       type: "info",
-      text: `${excludedRows} movimiento(s) de facturación/ingresos se excluyeron por no ser costo de un empleado.`
+      text: `${excludedRows} movimiento(s) se ignoraron por no ser costo de un empleado.`
+    });
+  }
+
+  if (facturaCount > 0) {
+    notes.push({
+      type: "info",
+      text: `${facturaCount} movimiento(s) de facturación (EO Third parties / Ingresos recibidos) se sumaron por mes y se cruzan contra el TOTAL EMPLOYEE COST de las nóminas.`
     });
   }
 
@@ -1281,4 +1324,4 @@ export function convertMovimientoFiles(files, options = {}) {
   });
 
   return result;
-}
+}  
