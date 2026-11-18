@@ -32,7 +32,8 @@ import {
   convertFacturacionFiles
 } from './facturacionConverter';
 import { cruzarNominaSiigo, CRUCE_LABEL, CRUCE_COLORS } from './cruceNominaSiigo';
-// OJO: este módulo también exporta CRUCE_COLORS, por eso se importa con otro nombre.
+// OJO: cruceTotalCostFactura también exporta CRUCE_COLORS; se importa con otro nombre
+// para no pisar los colores del cruce nómina vs Siigo.
 import { cruzarTotalCostConFactura, CRUCE_COLORS as TC_COLORS } from './cruceTotalCostFactura';
 
 // ============================================================================
@@ -54,6 +55,7 @@ import { cruzarTotalCostConFactura, CRUCE_COLORS as TC_COLORS } from './cruceTot
 // tal como vienen en el XML. Una celda con formato de fecha llega como el
 // número de serie de Excel, no como un objeto Date — quien la use (por
 // ejemplo convertMovimientoRows o convertFacturacionRows) debe decodificarla.
+// Una celda con fórmula que Excel nunca calculó llega como null (sin <v>).
 
 // Busca etiquetas por su nombre local, con o sin prefijo (x:row, row...).
 // Algunos Excel (p. ej. el de Siigo) escriben el XML con prefijo y
@@ -479,126 +481,242 @@ function colIndexToLetters(index) {
 }
 
 const VALUE_COLUMNS = new Set(['Valor Concepto', 'Valor Totales']);
-const FILL_HEXES = Object.keys(STATUS_COLORS);
-const NUMBER_STYLE_PLAIN = 2;
-const NUMBER_STYLE_FIRST_FILL = 3;
-
 // Ancho de cada columna en el Excel exportado (en caracteres).
 const EXCEL_COLUMN_WIDTH = {
   'Mes elaboración': 15,
   Concepto: 44,
   Empleado: 34,
   Documento: 16,
-  'Valor Concepto': 16,
-  'Valor Totales': 16
+  'Valor Concepto': 18,
+  'Valor Totales': 18,
+  Empresa: 22,
+  Mes: 14,
+  'Valor Nómina': 18,
+  'Valor Siigo': 18,
+  Diferencia: 18,
+  Estado: 26,
+  Periodo: 24,
+  'Archivo de nómina': 40,
+  'Total Employee Cost (nómina)': 26,
+  'EO Third parties (Siigo)': 24,
+  Empleados: 12,
+  'Archivos de nómina': 40,
+  Facturas: 48
 };
 
-function numberStyleFor(row) {
-  const idx = row._fill ? FILL_HEXES.indexOf(row._fill) : -1;
-  return idx >= 0 ? NUMBER_STYLE_FIRST_FILL + idx : NUMBER_STYLE_PLAIN;
+// ----------------------------------------------------------------------------
+// Escritor de Excel con formato: encabezado azul con letra blanca, bordes finos,
+// fila de encabezado fija, filtros, anchos de columna, montos en formato contable
+// y color de relleno por fila (_fill). Admite varias hojas.
+//   sheets: [{ name, columns: [{ key, header?, width, type }], rows, fillColumns? }]
+//   type:   'text' | 'money' | 'month' | 'int'
+//   fillColumns: si se indica, el color _fill solo se aplica a esas columnas;
+//                si no, se pinta toda la fila.
+// ----------------------------------------------------------------------------
+const XLSX_TYPES = ['text', 'money', 'month', 'int'];
+const XLSX_TYPE_FORMAT = {
+  text: [0, 'left'],
+  money: [164, 'right'], // contable (ceros como "-")
+  month: [17, 'left'], // mmm-yy
+  int: [3, 'right'] // #,##0
+};
+
+function normHex(value) {
+  if (typeof value !== 'string') return null;
+  const hex = value.replace('#', '').toUpperCase();
+  return /^[0-9A-F]{6}$/.test(hex) ? hex : null;
 }
 
-function buildSheetXml(dataRows, columns) {
-  const colsXml = columns
-    .map((colName, idx) => {
-      const width = EXCEL_COLUMN_WIDTH[colName] || 20;
-      return `<col min="${idx + 1}" max="${idx + 1}" width="${width}" customWidth="1"/>`;
-    })
-    .join('');
-
-  const headerCells = columns
-    .map((colName, idx) => {
-      const ref = `${colIndexToLetters(idx)}1`;
-      return `<c r="${ref}" t="inlineStr"><is><t>${xmlEscape(colName)}</t></is></c>`;
-    })
-    .join('');
-  let xmlRows = `<row r="1">${headerCells}</row>`;
-
-  dataRows.forEach((row, rIdx) => {
-    const rowNum = rIdx + 2;
-    const cells = columns
-      .map((colName, cIdx) => {
-        const ref = `${colIndexToLetters(cIdx)}${rowNum}`;
-        const val = row[colName];
-        if (val === null || val === undefined || val === '') {
-          return `<c r="${ref}"/>`;
-        }
-        if (val instanceof Date) {
-          const serial = excelSerialFromDate(val);
-          return `<c r="${ref}" s="1"><v>${serial}</v></c>`;
-        }
-        if (typeof val === 'number') {
-          const style = VALUE_COLUMNS.has(colName) ? numberStyleFor(row) : 0;
-          return `<c r="${ref}" s="${style}"><v>${val}</v></c>`;
-        }
-        return `<c r="${ref}" t="inlineStr"><is><t>${xmlEscape(String(val))}</t></is></c>`;
-      })
-      .join('');
-    xmlRows += `<row r="${rowNum}">${cells}</row>`;
-  });
-
-  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols>${colsXml}</cols><sheetData>${xmlRows}</sheetData></worksheet>`;
-}
-
-function buildStylesXml() {
+function buildStyledStylesXml(hexes) {
   const fills =
-    '<fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>' +
-    FILL_HEXES.map(
-      (hex) =>
-        `<fill><patternFill patternType="solid"><fgColor rgb="FF${hex}"/><bgColor indexed="64"/></patternFill></fill>`
-    ).join('');
-  const numberXf = (fillId) =>
-    `<xf numFmtId="164" fontId="0" fillId="${fillId}" borderId="0" xfId="0" applyNumberFormat="1"${
-      fillId ? ' applyFill="1"' : ''
-    }/>`;
-  const cellXfs =
-    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
-    '<xf numFmtId="17" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyAlignment="1"><alignment horizontal="left"/></xf>' +
-    numberXf(0) +
-    FILL_HEXES.map((_, i) => numberXf(i + 2)).join('');
+    '<fill><patternFill patternType="none"/></fill>' +
+    '<fill><patternFill patternType="gray125"/></fill>' +
+    '<fill><patternFill patternType="solid"><fgColor rgb="FF172554"/><bgColor indexed="64"/></patternFill></fill>' +
+    hexes
+      .map(
+        (hex) =>
+          `<fill><patternFill patternType="solid"><fgColor rgb="FF${hex}"/><bgColor indexed="64"/></patternFill></fill>`
+      )
+      .join('');
 
-  // numFmtId 164 = formato contable (ceros como "-"), igual que la Hoja2 de ejemplo;
-  // numFmtId 17 = mmm-yy (integrado).
+  const side = (name) => `<${name} style="thin"><color rgb="FFCBD5E1"/></${name}>`;
+  const borders =
+    '<border><left/><right/><top/><bottom/><diagonal/></border>' +
+    `<border>${side('left')}${side('right')}${side('top')}${side('bottom')}<diagonal/></border>`;
+
+  let cellXfs =
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
+    '<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>';
+
+  for (let fi = 0; fi <= hexes.length; fi++) {
+    const fillId = fi === 0 ? 0 : 2 + fi;
+    for (const type of XLSX_TYPES) {
+      const [fmt, align] = XLSX_TYPE_FORMAT[type];
+      cellXfs +=
+        `<xf numFmtId="${fmt}" fontId="0" fillId="${fillId}" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"${
+          fillId ? ' applyFill="1"' : ''
+        } applyAlignment="1"><alignment horizontal="${align}" vertical="center"/></xf>`;
+    }
+  }
+
   return (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
     '<numFmts count="1"><numFmt numFmtId="164" formatCode="_-* #,##0.00_-;\\-* #,##0.00_-;_-* &quot;-&quot;??_-;_-@_-"/></numFmts>' +
-    '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>' +
-    `<fills count="${FILL_HEXES.length + 2}">${fills}</fills>` +
-    '<borders count="1"><border/></borders>' +
+    '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts>' +
+    `<fills count="${3 + hexes.length}">${fills}</fills>` +
+    `<borders count="2">${borders}</borders>` +
     '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
-    `<cellXfs count="${FILL_HEXES.length + 3}">${cellXfs}</cellXfs>` +
+    `<cellXfs count="${2 + (hexes.length + 1) * XLSX_TYPES.length}">${cellXfs}</cellXfs>` +
     '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>' +
     '</styleSheet>'
   );
 }
 
-async function buildXlsxBlobWithJSZip(dataRows, columns) {
+function buildStyledSheetXml(sheet, isFirst, styleOf) {
+  const { columns, rows } = sheet;
+  const lastCol = colIndexToLetters(columns.length - 1);
+
+  const colsXml = columns
+    .map((c, i) => `<col min="${i + 1}" max="${i + 1}" width="${c.width || 20}" customWidth="1"/>`)
+    .join('');
+
+  const headerCells = columns
+    .map(
+      (c, i) =>
+        `<c r="${colIndexToLetters(i)}1" s="1" t="inlineStr"><is><t>${xmlEscape(c.header || c.key)}</t></is></c>`
+    )
+    .join('');
+  let body = `<row r="1" ht="26" customHeight="1">${headerCells}</row>`;
+
+  rows.forEach((row, rIdx) => {
+    const rowNum = rIdx + 2;
+    const hex = normHex(row._fill);
+    const cells = columns
+      .map((c, cIdx) => {
+        const ref = `${colIndexToLetters(cIdx)}${rowNum}`;
+        const type = c.type || 'text';
+        const colored = hex && (!sheet.fillColumns || sheet.fillColumns.includes(c.key));
+        const s = styleOf(type, colored ? hex : null);
+        const val = row[c.key];
+
+        if (val === null || val === undefined || val === '') return `<c r="${ref}" s="${s}"/>`;
+        if (val instanceof Date) {
+          if (type === 'month') return `<c r="${ref}" s="${s}"><v>${excelSerialFromDate(val)}</v></c>`;
+          return `<c r="${ref}" s="${s}" t="inlineStr"><is><t>${xmlEscape(formatCellValue(val))}</t></is></c>`;
+        }
+        if (typeof val === 'number' && Number.isFinite(val) && (type === 'money' || type === 'int')) {
+          return `<c r="${ref}" s="${s}"><v>${val}</v></c>`;
+        }
+        return `<c r="${ref}" s="${s}" t="inlineStr"><is><t>${xmlEscape(String(val))}</t></is></c>`;
+      })
+      .join('');
+    body += `<row r="${rowNum}">${cells}</row>`;
+  });
+
+  return (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+    `<sheetViews><sheetView ${isFirst ? 'tabSelected="1" ' : ''}showGridLines="0" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A2" sqref="A2"/></sheetView></sheetViews>` +
+    '<sheetFormatPr defaultRowHeight="15"/>' +
+    `<cols>${colsXml}</cols><sheetData>${body}</sheetData>` +
+    `<autoFilter ref="A1:${lastCol}${rows.length + 1}"/></worksheet>`
+  );
+}
+
+async function buildStyledXlsxBlob(sheets) {
+  const hexes = [];
+  for (const s of sheets) {
+    for (const r of s.rows) {
+      const h = normHex(r._fill);
+      if (h && !hexes.includes(h)) hexes.push(h);
+    }
+  }
+  const styleOf = (type, hex) => {
+    const fi = hex ? hexes.indexOf(hex) + 1 : 0;
+    return 2 + fi * XLSX_TYPES.length + XLSX_TYPES.indexOf(type);
+  };
+
   const zip = new JSZip();
+  const n = sheets.length;
+  const sheetOverrides = sheets
+    .map(
+      (_, i) =>
+        `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`
+    )
+    .join('');
 
-  const contentTypes =
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>';
-
-  const rootRels =
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>';
-
-  const workbookXml =
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Nomina largo" sheetId="1" r:id="rId1"/></sheets></workbook>';
-
-  const workbookRels =
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>';
-
-  zip.file('[Content_Types].xml', contentTypes);
-  zip.file('_rels/.rels', rootRels);
-  zip.file('xl/workbook.xml', workbookXml);
-  zip.file('xl/_rels/workbook.xml.rels', workbookRels);
-  zip.file('xl/styles.xml', buildStylesXml());
-  zip.file('xl/worksheets/sheet1.xml', buildSheetXml(dataRows, columns));
+  zip.file(
+    '[Content_Types].xml',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+      sheetOverrides +
+      '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>'
+  );
+  zip.file(
+    '_rels/.rels',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+  );
+  zip.file(
+    'xl/workbook.xml',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+      sheets
+        .map((s, i) => {
+          const safe = String(s.name || `Hoja${i + 1}`).replace(/[\\/?*[\]:]/g, ' ').slice(0, 31);
+          return `<sheet name="${xmlEscape(safe)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`;
+        })
+        .join('') +
+      '</sheets></workbook>'
+  );
+  zip.file(
+    'xl/_rels/workbook.xml.rels',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+      sheets
+        .map(
+          (_, i) =>
+            `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`
+        )
+        .join('') +
+      `<Relationship Id="rId${n + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`
+  );
+  zip.file('xl/styles.xml', buildStyledStylesXml(hexes));
+  sheets.forEach((s, i) =>
+    zip.file(`xl/worksheets/sheet${i + 1}.xml`, buildStyledSheetXml(s, i === 0, styleOf))
+  );
 
   return zip.generateAsync({
     type: 'blob',
     mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
   });
 }
+
+function downloadBlob(blob, fileName) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+// Columnas del Excel a partir de los nombres de columna (montos en formato contable).
+const excelColumns = (cols, numeric) =>
+  cols.map((col) => ({
+    key: col,
+    width: EXCEL_COLUMN_WIDTH[col] || 18,
+    type: col === 'Empleados' ? 'int' : numeric.has(col) ? 'money' : 'text'
+  }));
+
+// Orden cronológico de los periodos del cruce Total Cost ("Junio 2026", "Junio 2026 (offcycle)").
+const TC_MONTH_NAMES = [
+  'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio',
+  'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'
+];
+function periodoSortKey(label) {
+  const t = String(label || '').toLowerCase();
+  const m = TC_MONTH_NAMES.findIndex((x) => t.startsWith(x));
+  const y = /(20\d{2})/.exec(t);
+  return (y ? Number(y[1]) : 0) * 100 + (m >= 0 ? m + 1 : 0) + (t.includes('offcycle') ? 0.5 : 0);
+}
+const sortByPeriodo = (list) =>
+  [...list].sort((a, b) => periodoSortKey(a.Periodo) - periodoSortKey(b.Periodo));
 
 // ============================================================================
 // COMPONENTE PRINCIPAL
@@ -719,7 +837,7 @@ export default function App() {
   const [cruce, setCruce] = useState(null);
   const [cruceError, setCruceError] = useState('');
 
-  // Cruce Total Employee Cost (facturación) vs EO Third parties (Siigo).
+  // Cruce Total Employee Cost vs factura EO Third parties de Siigo.
   const [totalCost, setTotalCost] = useState(null);
   const [totalCostError, setTotalCostError] = useState('');
   const [totalCostTolerance, setTotalCostTolerance] = useState(10000);
@@ -830,7 +948,7 @@ export default function App() {
       const tag = (f) =>
         f.rows.map((r) => ({ ...r, Empresa: (empresaByFile[f.fileId] || '').trim() }));
       const result = cruzarNominaSiigo(nominaFiles.flatMap(tag), siigoFiles.flatMap(tag));
-      setSoloDiferencias(true);
+      setSoloDiferencias(false); // mostrar siempre todo el cruce; el filtro se activa a mano
       setCruce(result);
     } catch (err) {
       console.error('Error en el cruce', err);
@@ -844,25 +962,28 @@ export default function App() {
   }, [cruce, soloDiferencias]);
 
   // ---------------------------------------------------------------------------
-  // Cruce Total Employee Cost (facturación EOR) vs EO Third parties (Siigo)
-  // Usa las filas crudas { v, f } de cada hoja, no las filas en formato largo:
-  // el módulo lee por su cuenta TOTAL EMPLOYEE COST y las descripciones de factura.
+  // Cruce Total Employee Cost vs EO Third parties de Siigo (botón "Cruzar Total Cost")
   // ---------------------------------------------------------------------------
-  const facturaInputs = useMemo(
+  // Este cruce lee las filas crudas de cada hoja por su cuenta (no usa los registros
+  // convertidos). La nómina entra por su hoja INVOICING (facturación EOR): las nóminas
+  // en formato ancho traen varios meses por archivo y no tienen Payroll Month.
+  const tcFacturaInputs = useMemo(
     () =>
       processed
         .filter((f) => f.sourceType === 'facturacion' && f.facturacionRows)
         .map((f) => ({ name: f.fileName, rows: f.facturacionRows })),
     [processed]
   );
-  const movimientoInputs = useMemo(
+  const tcMovimientoInputs = useMemo(
     () =>
       processed
         .filter((f) => f.sourceType === 'movimiento' && f.movimientoRows)
         .map((f) => ({ name: f.fileName, rows: f.movimientoRows })),
     [processed]
   );
-  const canCruzarTotalCost = facturaInputs.length > 0 && movimientoInputs.length > 0;
+  const canCruzarTotalCost = tcFacturaInputs.length > 0 && tcMovimientoInputs.length > 0;
+  const hasWideNominaOnly =
+    tcFacturaInputs.length === 0 && processed.some((f) => f.sourceType === 'nomina');
 
   // Si cambian los archivos o la tolerancia, el resultado anterior ya no sirve.
   useEffect(() => {
@@ -876,9 +997,11 @@ export default function App() {
 
   const handleCruzarTotalCost = () => {
     try {
-      const result = cruzarTotalCostConFactura(facturaInputs, movimientoInputs, {
-        tolerance: Number(totalCostTolerance) || 0
+      const tolerance = Number(totalCostTolerance);
+      const result = cruzarTotalCostConFactura(tcFacturaInputs, tcMovimientoInputs, {
+        tolerance: Number.isFinite(tolerance) && tolerance >= 0 ? tolerance : 10000
       });
+      // El cruce devuelve null cuando no encuentra nada que comparar.
       if (!result) {
         setTotalCost(null);
         setTotalCostError(
@@ -887,8 +1010,8 @@ export default function App() {
         return;
       }
       setTotalCostError('');
-      setSoloProblemasTC(true);
-      setTotalCost(result);
+      setSoloProblemasTC(false); // mostrar siempre todo el cruce; el filtro se activa a mano
+      setTotalCost({ ...result, rows: sortByPeriodo(result.rows), detail: sortByPeriodo(result.detail) });
     } catch (err) {
       console.error('Error en el cruce Total Cost', err);
       setTotalCostError('No se pudo hacer el cruce: ' + err.message);
@@ -994,13 +1117,15 @@ export default function App() {
     if (filteredData.length === 0) return;
     setExporting(true);
     try {
-      const blob = await buildXlsxBlobWithJSZip(filteredData, OUTPUT_COLUMNS);
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = 'nomina_formato_largo.xlsx';
-      link.click();
-      URL.revokeObjectURL(url);
+      const columns = OUTPUT_COLUMNS.map((col) => ({
+        key: col,
+        width: EXCEL_COLUMN_WIDTH[col] || 20,
+        type: col === 'Mes elaboración' ? 'month' : VALUE_COLUMNS.has(col) ? 'money' : 'text'
+      }));
+      const blob = await buildStyledXlsxBlob([
+        { name: 'Nomina largo', columns, rows: filteredData, fillColumns: [...VALUE_COLUMNS] }
+      ]);
+      downloadBlob(blob, 'nomina_formato_largo.xlsx');
     } finally {
       setExporting(false);
     }
@@ -1049,6 +1174,44 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  // Excel con formato del cruce nómina vs Siigo (respeta el filtro, trae todas las filas).
+  const downloadCruceXLSX = async () => {
+    if (cruceRows.length === 0) return;
+    const rows = cruceRows.map((r) => ({
+      ...r,
+      Estado: CRUCE_LABEL[r.Estado] || r.Estado,
+      _fill: CRUCE_COLORS[r.Estado]
+    }));
+    const blob = await buildStyledXlsxBlob([
+      {
+        name: 'Cruce nomina vs Siigo',
+        columns: excelColumns(CRUCE_COLUMNS, CRUCE_NUMERIC),
+        rows,
+        fillColumns: ['Estado']
+      }
+    ]);
+    downloadBlob(blob, 'cruce_nomina_siigo.xlsx');
+  };
+
+  // Excel con formato del cruce Total Cost: hoja de resumen por periodo + hoja de detalle.
+  const downloadTotalCostXLSX = async () => {
+    if (!totalCost) return;
+    const blob = await buildStyledXlsxBlob([
+      {
+        name: 'Resumen por periodo',
+        columns: excelColumns(TC_SUMMARY_COLUMNS, TC_NUMERIC),
+        rows: totalCost.rows,
+        fillColumns: ['Estado']
+      },
+      {
+        name: 'Detalle',
+        columns: excelColumns(TC_DETAIL_COLUMNS, TC_NUMERIC),
+        rows: totalCostDetail
+      }
+    ]);
+    downloadBlob(blob, 'cruce_total_cost_factura.xlsx');
+  };
+
   // CSV del cruce: respeta el filtro "solo lo que no cuadra" y trae todas las filas,
   // no solo las que caben en pantalla. Los montos van como número plano.
   const downloadCruceCSV = () => {
@@ -1071,14 +1234,12 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  // CSV del cruce Total Cost (detalle archivo de nómina vs factura), respetando el filtro.
+  // CSV del detalle del cruce Total Cost (respeta el filtro, trae todas las filas).
   const downloadTotalCostCSV = () => {
     if (totalCostDetail.length === 0) return;
     const quote = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
     const lines = totalCostDetail.map((row) =>
-      TC_DETAIL_COLUMNS.map((col) =>
-        TC_NUMERIC.has(col) ? String(row[col]) : quote(row[col])
-      ).join(',')
+      TC_DETAIL_COLUMNS.map((col) => (TC_NUMERIC.has(col) ? String(row[col]) : quote(row[col]))).join(',')
     );
     const csvContent = [TC_DETAIL_COLUMNS.join(','), ...lines].join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -1126,13 +1287,17 @@ export default function App() {
       </div>
     );
 
+  // Celda de las tablas del cruce Total Cost: ceros como "-" y montos a la derecha.
+  const tcCell = (row, col) =>
+    TC_NUMERIC.has(col) && row[col] === 0 ? '-' : formatCellValue(row[col]);
+
   // Progreso de los pasos.
   const steps = [
     { label: 'Cargar archivos', done: hasFiles },
     { label: 'Revisar avisos', done: hasResults },
     { label: 'Exportar', done: false },
     { label: 'Cruzar nómina', done: Boolean(cruce) },
-    { label: 'Total Cost', done: Boolean(totalCost) }
+    { label: 'Cruzar Total Cost', done: Boolean(totalCost) }
   ];
   const activeStep = !hasFiles ? 0 : !hasResults ? 1 : 2;
 
@@ -1285,16 +1450,16 @@ export default function App() {
                 acumulados.
               </p>
               <p>
-                <strong className="text-slate-900">9. Cruzar Total Cost:</strong> con una
-                facturación EOR (hoja INVOICING) y un Movimiento CC de Siigo cargados, el paso 5
-                suma el TOTAL EMPLOYEE COST por periodo (mes y tipo: mensual u offcycle) y lo
-                compara con las facturas "EO Third parties" del Siigo. El periodo de la factura
-                sale del texto de la descripción ("..., June", "..., Offcycle June"), no de su
-                fecha. Cruza si la diferencia está dentro de la tolerancia (10.000 por defecto);
-                si una nómina cuadra con la suma de dos facturas, también la cruza. Si faltan
-                archivos de nómina de un mes, las facturas correspondientes quedan en amarillo. El
-                Excel de nómina debe venir calculado: si TOTAL EMPLOYEE COST no tiene valor, abre
-                y guarda el archivo en Excel antes de subirlo.
+                <strong className="text-slate-900">9. Cruzar Total Cost:</strong> compara el
+                TOTAL EMPLOYEE COST de cada facturación EOR (hoja INVOICING) contra las facturas
+                "EO Third parties" del Movimiento CC de Siigo (paso 5). El periodo de la factura
+                sale del texto de la descripción ("..., June", "..., Offcycle June"), no de la
+                fecha de elaboración: una factura de abril hecha en junio cruza con abril. Cruza
+                bien si la diferencia es de hasta la tolerancia (10.000 por defecto). Si un archivo
+                de nómina no cuadra con una factura sola, prueba con la suma de dos. Amarillo
+                significa que de un lado falta el otro (puede faltar subir un archivo). El Excel de
+                facturación debe venir calculado: si TOTAL EMPLOYEE COST no tiene valor, ábrelo y
+                guárdalo en Excel antes de subirlo.
               </p>
             </div>
           )}
@@ -1753,6 +1918,14 @@ export default function App() {
                       Solo lo que no cuadra
                     </label>
                     <button
+                      onClick={downloadCruceXLSX}
+                      disabled={cruceRows.length === 0}
+                      className="flex items-center gap-1.5 px-3.5 py-2 bg-blue-900 hover:bg-blue-800 disabled:opacity-50 text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer"
+                    >
+                      <FileSpreadsheet className="w-4 h-4" />
+                      Excel del cruce
+                    </button>
+                    <button
                       onClick={downloadCruceCSV}
                       disabled={cruceRows.length === 0}
                       className="flex items-center gap-1.5 px-3.5 py-2 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 text-slate-700 font-semibold text-xs rounded-lg cursor-pointer"
@@ -1839,7 +2012,7 @@ export default function App() {
           </section>
         )}
 
-        {/* Paso 5: Total Employee Cost vs facturas EO Third parties de Siigo */}
+        {/* Paso 5: cruzar Total Employee Cost vs factura EO Third parties de Siigo */}
         {hasFiles && !loading && (
           <section
             ref={totalCostRef}
@@ -1874,29 +2047,34 @@ export default function App() {
               <div className="flex flex-wrap gap-2 text-xs font-medium">
                 <span
                   className={`px-3 py-1 rounded-full ring-1 ${
-                    facturaInputs.length
+                    tcFacturaInputs.length
                       ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
                       : 'bg-slate-50 text-slate-500 ring-slate-200'
                   }`}
                 >
-                  {facturaInputs.length ? '✓' : '○'} Facturación EOR ({facturaInputs.length})
+                  {tcFacturaInputs.length ? '✓' : '○'} Facturación EOR / INVOICING ({tcFacturaInputs.length})
                 </span>
                 <span
                   className={`px-3 py-1 rounded-full ring-1 ${
-                    movimientoInputs.length
+                    tcMovimientoInputs.length
                       ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
                       : 'bg-slate-50 text-slate-500 ring-slate-200'
                   }`}
                 >
-                  {movimientoInputs.length ? '✓' : '○'} Movimiento CC de Siigo (
-                  {movimientoInputs.length})
+                  {tcMovimientoInputs.length ? '✓' : '○'} Movimiento CC de Siigo ({tcMovimientoInputs.length})
                 </span>
               </div>
 
               {!canCruzarTotalCost && (
                 <p className="text-xs text-slate-500">
                   Carga al menos una facturación EOR (hoja INVOICING) y un Movimiento CC de Siigo
-                  para activar este cruce.
+                  para activar el cruce.
+                </p>
+              )}
+              {hasWideNominaOnly && (
+                <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                  Cargaste nóminas en formato ancho (un bloque por mes), pero este cruce necesita
+                  la hoja INVOICING con Payroll Month. Sube el archivo de facturación EOR.
                 </p>
               )}
               {totalCostError && <p className="text-xs text-red-700">{totalCostError}</p>}
@@ -1932,20 +2110,16 @@ export default function App() {
                     </thead>
                     <tbody className="divide-y divide-slate-100">
                       {totalCost.rows.map((row, idx) => (
-                        <tr key={idx}>
+                        <tr key={idx} className="hover:bg-slate-50 transition-colors">
                           {TC_SUMMARY_COLUMNS.map((col) => (
                             <td
                               key={col}
                               className={`px-4 py-2 whitespace-nowrap ${
                                 TC_NUMERIC.has(col) ? 'text-right tabular-nums' : ''
                               }`}
-                              style={
-                                col === 'Estado' ? { backgroundColor: `#${row._fill}` } : undefined
-                              }
+                              style={col === 'Estado' ? { backgroundColor: `#${row._fill}` } : undefined}
                             >
-                              {TC_NUMERIC.has(col) && row[col] === 0
-                                ? '-'
-                                : formatCellValue(row[col])}
+                              {tcCell(row, col)}
                             </td>
                           ))}
                         </tr>
@@ -1954,7 +2128,7 @@ export default function App() {
                   </table>
                 </div>
 
-                {/* Detalle: archivo de nómina vs factura */}
+                {/* Detalle archivo de nómina vs factura */}
                 <div className="px-6 py-3 bg-slate-50 border-y border-slate-100 flex flex-wrap items-center justify-between gap-3">
                   <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-600">
                     {[
@@ -1981,6 +2155,14 @@ export default function App() {
                       />
                       Solo lo que no cuadra
                     </label>
+                    <button
+                      onClick={downloadTotalCostXLSX}
+                      disabled={totalCostDetail.length === 0}
+                      className="flex items-center gap-1.5 px-3.5 py-2 bg-blue-900 hover:bg-blue-800 disabled:opacity-50 text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer"
+                    >
+                      <FileSpreadsheet className="w-4 h-4" />
+                      Excel del cruce
+                    </button>
                     <button
                       onClick={downloadTotalCostCSV}
                       disabled={totalCostDetail.length === 0}
@@ -2018,9 +2200,7 @@ export default function App() {
                                 TC_NUMERIC.has(col) ? 'text-right tabular-nums' : ''
                               }`}
                             >
-                              {TC_NUMERIC.has(col) && row[col] === 0
-                                ? '-'
-                                : formatCellValue(row[col])}
+                              {tcCell(row, col)}
                             </td>
                           ))}
                         </tr>
@@ -2031,7 +2211,9 @@ export default function App() {
                             colSpan={TC_DETAIL_COLUMNS.length}
                             className="px-5 py-10 text-center text-slate-500"
                           >
-                            Todo cruza dentro de la tolerancia.
+                            {totalCost.detail.length === 0
+                              ? 'No hay líneas para comparar entre los archivos cargados.'
+                              : 'Todo cruza dentro de la tolerancia.'}
                           </td>
                         </tr>
                       )}
